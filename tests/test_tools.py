@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.cli import parse_args
 from app.main import build_runtime
-from config.paths import get_project_state_dir
+from config.paths import get_global_permissions_path, get_project_state_dir, get_siyi_config_path
 from engine.events import ErrorEvent, FinalAnswerEvent, ToolOutputDeltaEvent, ToolResultEvent
 from engine.message_schema import ToolResultBlock, ToolUseBlock
 from llm.base import LLMAdapter, LLMAssistantDone, LLMTextDelta, LLMToolUse
@@ -573,10 +573,12 @@ class ProgressToolLLM(LLMAdapter):
 
 
 def test_query_engine_executes_tool_use_and_continues(tmp_path: Path) -> None:
-    permissions_dir = get_project_state_dir(tmp_path)
-    permissions_dir.mkdir(parents=True)
-    (permissions_dir / "permissions.json").write_text(
-        json.dumps({"permissions": {"allow": ["Write(*)"]}}),
+    config_path = get_siyi_config_path()
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"permission_mode": "custom"}), encoding="utf-8")
+    permissions_path = get_global_permissions_path()
+    permissions_path.write_text(
+        json.dumps({"custom_permissions": {"allow": ["Write(*)"]}}),
         encoding="utf-8",
     )
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
@@ -611,10 +613,12 @@ def test_concurrent_read_file_alias_calls_do_not_trigger_permission_prompt_crash
 
 
 def test_tool_output_delta_events_are_emitted_but_not_persisted(tmp_path: Path) -> None:
-    permissions_dir = get_project_state_dir(tmp_path)
-    permissions_dir.mkdir(parents=True)
-    (permissions_dir / "permissions.json").write_text(
-        json.dumps({"permissions": {"allow": ["ProgressTool(*)"]}}),
+    config_path = get_siyi_config_path()
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"permission_mode": "custom"}), encoding="utf-8")
+    permissions_path = get_global_permissions_path()
+    permissions_path.write_text(
+        json.dumps({"custom_permissions": {"allow": ["ProgressTool(*)"]}}),
         encoding="utf-8",
     )
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))

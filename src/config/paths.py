@@ -17,6 +17,14 @@ def get_siyi_home() -> Path:
     return (Path.home() / ".siyi").resolve()
 
 
+def get_siyi_config_path() -> Path:
+    return (get_siyi_home() / "config.json").resolve()
+
+
+def get_global_permissions_path() -> Path:
+    return (get_siyi_home() / "permissions.json").resolve()
+
+
 def get_projects_dir() -> Path:
     return (get_siyi_home() / "projects").resolve()
 

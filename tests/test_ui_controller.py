@@ -25,6 +25,7 @@ class _Snapshot:
     last_error: str | None = None
     total_usage: dict[str, int] = None  # type: ignore[assignment]
     estimated_total_cost: float = 0.0
+    permission_mode: str = "default"
 
     def __post_init__(self) -> None:
         if self.total_usage is None:
@@ -71,8 +72,8 @@ class _FakeEngine:
         self.submitted_prompts: list[str] = []
         self.compact_instructions: str | None = None
         self.sessions = [
-            SimpleNamespace(session_id="sess_test"),
-            SimpleNamespace(session_id="sess_other"),
+            SimpleNamespace(session_id="sess_test", permission_mode="default"),
+            SimpleNamespace(session_id="sess_other", permission_mode="full"),
         ]
         self.settings = SimpleNamespace(
             model=ModelSettings(),
@@ -92,6 +93,29 @@ class _FakeEngine:
     async def switch_session(self, session_id: str):
         self.snapshot = _Snapshot(session_id=session_id)
         return self.snapshot
+
+    def get_permission_snapshot(self):
+        return SimpleNamespace(
+            session_mode=self.snapshot.permission_mode,
+            global_mode="default",
+            config_path="C:/home/.siyi/config.json",
+            permissions_path="C:/home/.siyi/permissions.json",
+        )
+
+    def set_permission_mode(self, mode: str):
+        self.snapshot = _Snapshot(
+            session_id=self.snapshot.session_id,
+            permission_mode=mode,
+        )
+        return self.get_permission_snapshot()
+
+    def set_global_permission_mode(self, mode: str):
+        return SimpleNamespace(
+            session_mode=self.snapshot.permission_mode,
+            global_mode=mode,
+            config_path="C:/home/.siyi/config.json",
+            permissions_path="C:/home/.siyi/permissions.json",
+        )
 
     def get_recent_messages(self, limit: int = 10, *, include_meta: bool = False):
         del include_meta
@@ -144,6 +168,7 @@ def test_controller_renders_help_and_session() -> None:
             "sessions",
             "session_new",
             "session_switch",
+            "permission",
             "history",
             "retry",
             "add_skill_path",
@@ -169,6 +194,26 @@ def test_controller_session_commands() -> None:
     assert renderer.calls[0] == ("sessions", ["sess_test", "sess_other"], "sess_test")
     assert renderer.calls[1] == ("note", "started new session: sess_new")
     assert renderer.calls[2] == ("note", "switched to session: sess_other cwd=C:/workspace")
+
+
+def test_controller_permission_commands() -> None:
+    engine = _FakeEngine()
+    renderer = _FakeRenderer()
+    controller = REPLController(engine, renderer)
+
+    asyncio.run(controller.handle(parse_input("/permission")))
+    asyncio.run(controller.handle(parse_input("/permission full")))
+    asyncio.run(controller.handle(parse_input("/permission --global custom")))
+    asyncio.run(controller.handle(parse_input("/permission nope")))
+
+    assert renderer.calls[0][0] == "note"
+    assert "session=default global=default" in renderer.calls[0][1]
+    assert renderer.calls[1] == ("note", "session permission mode set to full")
+    assert renderer.calls[2] == (
+        "note",
+        "global permission mode set to custom; current session remains full",
+    )
+    assert renderer.calls[3][0] == "error"
 
 
 def test_controller_history_validates_count() -> None:

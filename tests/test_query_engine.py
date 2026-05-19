@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from app.cli import parse_args
 from app.main import build_runtime
+from config.paths import get_siyi_config_path
 from engine.events import ErrorEvent, FinalAnswerEvent
 from engine.message_schema import (
     ToolUseBlock,
@@ -142,6 +144,32 @@ def test_global_session_index_and_cross_cwd_switch(tmp_path: Path) -> None:
     assert Path(os.environ["SIYI_CWD"]) == first_cwd.resolve()
     assert second.query_engine.get_messages()[0].to_plain_text() == "first question"
     assert second.query_engine.turn_counter == 1
+
+
+def test_session_permission_mode_inherits_global_default_and_switches(tmp_path: Path) -> None:
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    config_path = get_siyi_config_path()
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"permission_mode": "full"}), encoding="utf-8")
+
+    first = build_runtime(parse_args(["--cwd", str(first_cwd)]))
+    assert first.query_engine.get_session_snapshot().permission_mode == "full"
+    first_session_id = first.query_engine.session.session_id
+
+    first.query_engine.set_permission_mode("custom")
+    assert first.query_engine.get_session_snapshot().permission_mode == "custom"
+
+    config_path.write_text(json.dumps({"permission_mode": "default"}), encoding="utf-8")
+    second = build_runtime(parse_args(["--cwd", str(second_cwd)]))
+    assert second.query_engine.get_session_snapshot().permission_mode == "default"
+
+    snapshot = asyncio.run(second.query_engine.switch_session(first_session_id))
+
+    assert snapshot.permission_mode == "custom"
+    assert second.query_engine.permission_manager.mode == "custom"
 
 
 def test_session_switch_rejects_missing_cwd_without_changing_current_session(tmp_path: Path) -> None:

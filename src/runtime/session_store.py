@@ -28,6 +28,7 @@ class SessionMetadata:
     created_at: str
     updated_at: str
     model: str
+    permission_mode: str = "default"
     message_count: int = 0
     legacy: bool = False
 
@@ -42,12 +43,21 @@ class SessionMetadata:
             created_at=str(payload.get("created_at") or _now()),
             updated_at=str(payload.get("updated_at") or payload.get("created_at") or _now()),
             model=str(payload.get("model") or ""),
+            permission_mode=str(payload.get("permission_mode") or "default"),
             message_count=int(payload.get("message_count") or 0),
             legacy=bool(payload.get("legacy", False)),
         )
 
     @classmethod
-    def create(cls, *, session_id: str, root: Path, cwd: Path, model: str) -> "SessionMetadata":
+    def create(
+        cls,
+        *,
+        session_id: str,
+        root: Path,
+        cwd: Path,
+        model: str,
+        permission_mode: str = "default",
+    ) -> "SessionMetadata":
         timestamp = _now()
         project_state_dir = get_project_state_dir(cwd)
         return cls(
@@ -59,6 +69,7 @@ class SessionMetadata:
             created_at=timestamp,
             updated_at=timestamp,
             model=model,
+            permission_mode=permission_mode,
             message_count=0,
         )
 
@@ -72,6 +83,7 @@ class SessionMetadata:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "model": self.model,
+            "permission_mode": self.permission_mode,
             "message_count": self.message_count,
             "legacy": self.legacy,
         }
@@ -96,6 +108,7 @@ class JsonlSessionStore:
         requested_session: str | bool | None,
         cwd: Path,
         model: str = "",
+        permission_mode: str = "default",
     ) -> SessionHandle:
         if isinstance(requested_session, str):
             metadata = self.get_metadata(requested_session)
@@ -110,14 +123,21 @@ class JsonlSessionStore:
             if metadata is not None:
                 return self._open_metadata(metadata, cwd_for_log=Path(metadata.cwd))
 
-        return self.create_session(cwd=cwd, model=model)
+        return self.create_session(cwd=cwd, model=model, permission_mode=permission_mode)
 
-    def create_session(self, *, cwd: Path, model: str = "") -> SessionHandle:
+    def create_session(
+        self,
+        *,
+        cwd: Path,
+        model: str = "",
+        permission_mode: str = "default",
+    ) -> SessionHandle:
         metadata = SessionMetadata.create(
             session_id=new_id("sess"),
             root=self.root,
             cwd=cwd,
             model=model,
+            permission_mode=permission_mode,
         )
         metadata.path.parent.mkdir(parents=True, exist_ok=True)
         self._append_entry(
@@ -183,6 +203,19 @@ class JsonlSessionStore:
             },
         )
         self._touch_metadata(session.metadata)
+
+    def update_metadata(self, session: SessionHandle) -> None:
+        session.metadata.updated_at = _now()
+        self._append_entry(
+            session.path,
+            {
+                "kind": "session_meta",
+                "session_id": session.session_id,
+                "timestamp": session.metadata.updated_at,
+                "meta": session.metadata.to_json(),
+            },
+        )
+        self._save_metadata(session.metadata)
 
     def load_messages(self, session_id: str) -> list[Message]:
         metadata = self.get_metadata(session_id)
@@ -301,6 +334,7 @@ class JsonlSessionStore:
         messages = 0
         created_at = _now()
         updated_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        found_metadata: SessionMetadata | None = None
         if path.exists():
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -310,12 +344,14 @@ class JsonlSessionStore:
                     if entry.get("kind") == "session_meta" and isinstance(entry.get("meta"), dict):
                         metadata = SessionMetadata.from_json(entry["meta"])
                         metadata.path = path.resolve()
-                        metadata.updated_at = updated_at
-                        metadata.message_count = self._count_messages(path)
-                        return metadata
+                        found_metadata = metadata
                     if entry.get("kind") == "message":
                         messages += 1
                     created_at = str(entry.get("timestamp") or created_at)
+        if found_metadata is not None:
+            found_metadata.updated_at = updated_at
+            found_metadata.message_count = messages
+            return found_metadata
         return SessionMetadata(
             session_id=path.stem,
             path=path.resolve(),
@@ -325,6 +361,7 @@ class JsonlSessionStore:
             created_at=created_at,
             updated_at=updated_at,
             model="",
+            permission_mode="default",
             message_count=messages,
             legacy=True,
         )

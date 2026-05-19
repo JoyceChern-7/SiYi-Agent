@@ -56,6 +56,7 @@ class REPLController:
             CommandSpec("sessions", "/sessions", "List global sessions."),
             CommandSpec("session_new", "/session_new", "Start a new global session for the current cwd."),
             CommandSpec("session_switch", "/session_switch <session_id>", "Switch to a global session and follow its cwd."),
+            CommandSpec("permission", "/permission [--global] <default|full|custom>", "Show or change the permission mode."),
             CommandSpec("history", "/history [count]", "Show recent transcript messages."),
             CommandSpec("retry", "/retry", "Resubmit the most recent user prompt."),
             CommandSpec("add_skill_path", "/add_skill_path <path>", "Add a global skill search path."),
@@ -133,6 +134,9 @@ class REPLController:
                 f"switched to session: {snapshot.session_id} cwd={snapshot.cwd}"
             )
             return True
+        if command == "permission":
+            self._handle_permission(parsed.args)
+            return True
         if command == "history":
             return self._handle_history(parsed.args)
         if command == "debug":
@@ -155,6 +159,36 @@ class REPLController:
 
         self.renderer.render_error(f"unknown command: /{parsed.command}")
         return True
+
+    def _handle_permission(self, args: list[str]) -> None:
+        valid_modes = {"default", "full", "custom"}
+        if not args:
+            snapshot = self.engine.get_permission_snapshot()
+            self.renderer.render_note(
+                "permission mode: "
+                f"session={snapshot.session_mode} global={snapshot.global_mode}\n"
+                f"config={snapshot.config_path}\n"
+                f"permissions={snapshot.permissions_path}"
+            )
+            return
+
+        if args[0] == "--global":
+            if len(args) != 2 or args[1] not in valid_modes:
+                self.renderer.render_error("usage: /permission --global <default|full|custom>")
+                return
+            snapshot = self.engine.set_global_permission_mode(args[1])
+            self.renderer.render_note(
+                f"global permission mode set to {snapshot.global_mode}; "
+                f"current session remains {snapshot.session_mode}"
+            )
+            return
+
+        if len(args) != 1 or args[0] not in valid_modes:
+            self.renderer.render_error("usage: /permission [--global] <default|full|custom>")
+            return
+
+        snapshot = self.engine.set_permission_mode(args[0])
+        self.renderer.render_note(f"session permission mode set to {snapshot.session_mode}")
 
     def _handle_history(self, args: list[str]) -> bool:
         if len(args) > 1:

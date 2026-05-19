@@ -13,7 +13,11 @@ from engine.query_engine import QueryEngine
 from llm.openai_adapter import OpenAIChatAdapter
 from runtime.compaction import CompactionManager
 from runtime.logging_utils import configure_logging
-from runtime.permissions import PermissionManager
+from runtime.permissions import (
+    PermissionManager,
+    ensure_permission_files,
+    load_global_permission_mode,
+)
 from runtime.session_store import JsonlSessionStore
 from runtime.token_budget import TokenBudget
 from runtime.usage_tracker import UsageTracker
@@ -75,10 +79,13 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
     )
 
     session_store = JsonlSessionStore(settings.runtime.session_dir)
+    ensure_permission_files()
+    permission_mode = load_global_permission_mode()
     session = session_store.open_session(
         requested_session=settings.runtime.resume,
         cwd=cwd,
         model=settings.model.model,
+        permission_mode=permission_mode,
     )
     session_cwd = Path(session.metadata.cwd).expanduser().resolve()
     if not session_cwd.exists() or not session_cwd.is_dir():
@@ -88,7 +95,11 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
         settings.runtime.cwd = session_cwd
         cwd = session_cwd
 
-    permission_manager = PermissionManager.from_settings(settings.tools, cwd=cwd)
+    permission_manager = PermissionManager.from_settings(
+        settings.tools,
+        cwd=cwd,
+        mode=session.metadata.permission_mode,
+    )
     tool_registry = ToolRegistry.default(permission_manager=permission_manager)
     compaction_manager = CompactionManager(settings.runtime.compaction_enabled)
     token_budget = TokenBudget(settings.runtime)

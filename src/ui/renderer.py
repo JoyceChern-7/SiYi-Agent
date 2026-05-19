@@ -128,6 +128,7 @@ class ConsoleRenderer:
         table.add_row("project_state", snapshot.project_state_dir)
         table.add_row("session_path", snapshot.session_path)
         table.add_row("model", snapshot.model)
+        table.add_row("permission_mode", snapshot.permission_mode)
         table.add_row("turns", str(snapshot.turn_count))
         table.add_row("completed_turns", str(snapshot.completed_turns))
         table.add_row("messages", str(snapshot.message_count))
@@ -147,6 +148,7 @@ class ConsoleRenderer:
         table.add_column("session")
         table.add_column("cwd")
         table.add_column("model")
+        table.add_column("permission")
         table.add_column("messages", justify="right")
         table.add_column("updated")
         for metadata in sessions:
@@ -157,6 +159,7 @@ class ConsoleRenderer:
                 metadata.session_id,
                 cwd_name,
                 metadata.model or "-",
+                metadata.permission_mode,
                 str(metadata.message_count),
                 metadata.updated_at,
             )

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from config.paths import get_global_permissions_path, get_siyi_config_path
 from config.settings import AppSettings
 from engine.events import (
     ErrorEvent,
@@ -24,7 +25,11 @@ from engine.query_loop import DefaultQueryLoop, QueryLoop
 from engine.turn_state import QueryTurnState
 from llm.base import LLMAdapter
 from runtime.compaction import CompactionManager, CompactionResult
-from runtime.permissions import PermissionManager
+from runtime.permissions import (
+    PermissionManager,
+    load_global_permission_mode,
+    save_global_permission_mode,
+)
 from runtime.session_store import JsonlSessionStore, SessionHandle, SessionMetadata
 from runtime.token_budget import BudgetSnapshot, TokenBudget
 from runtime.usage_tracker import UsageTracker
@@ -48,6 +53,15 @@ class SessionSnapshot:
     last_error: str | None
     total_usage: dict[str, int]
     estimated_total_cost: float
+    permission_mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionSnapshot:
+    session_mode: str
+    global_mode: str
+    config_path: str
+    permissions_path: str
 
 
 class QueryEngine:
@@ -249,6 +263,7 @@ class QueryEngine:
         session = self.session_store.create_session(
             cwd=self.settings.runtime.cwd,
             model=self.settings.model.model,
+            permission_mode=load_global_permission_mode(),
         )
         self._activate_session(session)
         return self.get_session_snapshot()
@@ -269,12 +284,30 @@ class QueryEngine:
         os.chdir(cwd)
         os.environ["SIYI_CWD"] = str(cwd)
         self.settings.runtime.cwd = cwd
-        self.permission_manager.reload_for_cwd(cwd)
+        self.permission_manager.reload_for_cwd(cwd, mode=metadata.permission_mode)
         self._activate_session(session)
         return self.get_session_snapshot()
 
     def list_sessions(self) -> list[SessionMetadata]:
         return self.session_store.list_sessions()
+
+    def get_permission_snapshot(self) -> PermissionSnapshot:
+        return PermissionSnapshot(
+            session_mode=self.permission_manager.mode,
+            global_mode=load_global_permission_mode(),
+            config_path=str(get_siyi_config_path()),
+            permissions_path=str(get_global_permissions_path()),
+        )
+
+    def set_permission_mode(self, mode: str) -> PermissionSnapshot:
+        permission_mode = self.permission_manager.set_mode(mode)
+        self.session.metadata.permission_mode = permission_mode
+        self.session_store.update_metadata(self.session)
+        return self.get_permission_snapshot()
+
+    def set_global_permission_mode(self, mode: str) -> PermissionSnapshot:
+        save_global_permission_mode(mode)
+        return self.get_permission_snapshot()
 
     async def _compact_messages(
         self,
@@ -403,6 +436,7 @@ class QueryEngine:
     def _activate_session(self, session: SessionHandle) -> None:
         self.session = session
         self.mutable_messages = list(session.messages)
+        self.permission_manager.set_mode(session.metadata.permission_mode)
         self.current_turn = None
         self.last_error = None
         self.turn_counter = self._derive_turn_counter()
@@ -458,4 +492,5 @@ class QueryEngine:
             last_error=self.last_error,
             total_usage=total_usage.model_dump(),
             estimated_total_cost=self.usage_tracker.estimate_cost(total_usage),
+            permission_mode=self.permission_manager.mode,
         )
