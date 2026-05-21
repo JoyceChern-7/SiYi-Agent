@@ -348,7 +348,7 @@ class PermissionManager:
     @staticmethod
     def _is_shell_tool(tool_name: str, tool_input: dict[str, Any] | None = None) -> bool:
         del tool_input
-        return tool_name in {"shell", "Bash", "PowerShell", "ProcessStart"}
+        return tool_name in {"shell", "Bash", "PowerShell", "ProcessStart", "exec_command"}
 
 
 def load_permission_config(cwd: Path | None) -> PermissionConfig:
@@ -415,6 +415,7 @@ def _default_permission_rules() -> PermissionRules:
         ask=[
             "Bash(*)",
             "PowerShell(*)",
+            "exec_command(*)",
             "ProcessStart(*)",
             "ProcessWrite(*)",
             "ProcessStop(*)",
@@ -439,7 +440,7 @@ def _match_shell_exec_rules(
     tool_name: str,
     tool_input: dict[str, Any],
 ) -> PermissionResult | None:
-    command = str(tool_input.get("command") or "")
+    command = str(tool_input.get("command") or tool_input.get("cmd") or "")
     lowered_command = command.lower()
     for decision, patterns in (
         ("deny", rules.deny_glob),
@@ -511,7 +512,7 @@ def _format_prefix(prefix: list[str]) -> str:
 
 
 def _analyze_shell_command(tool_name: str, tool_input: dict[str, Any]):
-    command = str(tool_input.get("command") or "")
+    command = str(tool_input.get("command") or tool_input.get("cmd") or "")
     shell = str(tool_input.get("shell") or tool_name)
     if tool_name == "Bash" or shell == "Bash":
         return analyze_bash(command)
@@ -535,8 +536,10 @@ def _combine_permissions(*results: PermissionResult) -> PermissionResult:
 
 
 def _permission_payload(tool_name: str, tool_input: dict[str, Any]) -> str:
-    if tool_name in {"Bash", "PowerShell", "ProcessStart", "shell"}:
-        return str(tool_input.get("command") or "*")
+    if tool_name in {"Bash", "PowerShell", "ProcessStart", "shell", "exec_command"}:
+        return str(tool_input.get("command") or tool_input.get("cmd") or "*")
+    if tool_name in {"write_stdin", "stop_command"}:
+        return str(tool_input.get("session_id") or "*")
     for key in ("action", "file_path", "path", "notebook_path", "uri", "query", "title", "task_id"):
         if key in tool_input and tool_input[key] is not None:
             return str(tool_input[key])
@@ -569,6 +572,8 @@ def _is_default_read_tool(tool_name: str, tool_input: dict[str, Any]) -> bool:
         "WebFetch",
         "ToolSearch",
         "ProcessRead",
+        "write_stdin",
+        "stop_command",
         "TaskGet",
         "TaskList",
         "Skill",

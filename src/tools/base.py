@@ -32,6 +32,7 @@ class Tool(Protocol):
     name: str
     description: str
     input_schema: dict[str, Any]
+    model_visible: bool
 
     async def run(self, raw_input: dict[str, Any], context: ToolContext) -> ToolResult:
         ...
@@ -56,6 +57,7 @@ class BaseTool:
     name: str
     description: str
     input_schema: dict[str, Any]
+    model_visible: bool = True
     read_only: bool = False
 
     def validate_input(

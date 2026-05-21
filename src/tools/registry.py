@@ -29,6 +29,13 @@ class ToolRegistry:
     def get_tools(self) -> list[Tool]:
         return list(self.tools.values())
 
+    def get_model_tools(self) -> list[Tool]:
+        return [
+            tool
+            for tool in self.get_tools()
+            if getattr(tool, "model_visible", True)
+        ]
+
     def get_aliases(self) -> dict[str, str]:
         return dict(self.aliases)
 
@@ -53,7 +60,7 @@ class ToolRegistry:
 
     def to_model_tool_schemas(self) -> list[dict]:
         schemas: list[dict] = []
-        for tool in self.get_tools():
+        for tool in self.get_model_tools():
             schemas.append(
                 {
                     "type": "function",

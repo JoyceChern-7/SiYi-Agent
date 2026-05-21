@@ -85,10 +85,13 @@ def test_default_shell_permission_uses_exec_rules(tmp_path: Path) -> None:
 def test_default_process_session_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
 
+    assert manager.check("exec_command", {"cmd": "Get-ChildItem"}).decision == "allow"
     assert manager.check("ProcessStart", {"command": "npm run dev"}).decision == "ask"
     assert manager.check("ProcessRead", {"process_id": "proc_test"}).decision == "allow"
     assert manager.check("ProcessWrite", {"process_id": "proc_test", "chars": "y\n"}).decision == "ask"
     assert manager.check("ProcessStop", {"process_id": "proc_test"}).decision == "ask"
+    assert manager.check("write_stdin", {"session_id": "proc_test", "chars": ""}).decision == "allow"
+    assert manager.check("stop_command", {"session_id": "proc_test"}).decision == "allow"
 
 
 def test_alias_tools_inherit_target_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

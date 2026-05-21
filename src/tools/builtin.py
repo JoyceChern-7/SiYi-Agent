@@ -29,6 +29,18 @@ from tools.shell_analysis import analyze_bash, analyze_powershell
 
 JsonObject = dict[str, Any]
 
+DEFAULT_OUTPUT_IDLE_TIMEOUT_MS = 500 
+# 交互式进程在没有输出时的空闲超时时间, 超过这个时间会直接将当前进程的输出结果返回给模型, 但不杀进程
+
+DEFAULT_TTY_TIMEOUT_MS = 300_000
+# 交互式进程的最大等待时间, 超过这个时间会强制杀死进程并返回结果.
+
+DEFAULT_NON_TTY_TIMEOUT_MS = 10_000
+# 非交互式进程的最大等待时间, 超过这个时间会强制杀死进程并返回结果.
+
+MAX_TOOL_WAIT_MS = 30_000
+# 工具的最大等待时间, 超过这个时间会强制返回结果, 但不杀进程.
+
 
 def _schema(properties: JsonObject, required: list[str] | None = None) -> JsonObject:
     return {
@@ -96,19 +108,13 @@ def _coerce_source(value: Any) -> list[str]:
 
 
 def _timeout_seconds(raw_input: JsonObject, *, default: float = 10.0) -> float:
-    for key, scale in (
-        ("timeout_ms", 1000.0),
-        ("timeout_seconds", 1.0),
-        ("timeout", 1.0),
-    ):
-        if key not in raw_input or raw_input[key] is None:
-            continue
-        try:
-            value = float(raw_input[key]) / scale
-        except (TypeError, ValueError):
-            return default
-        return max(0.001, value)
-    return default
+    if raw_input.get("timeout_ms") is None:
+        return default
+    try:
+        value = float(raw_input["timeout_ms"]) / 1000.0
+    except (TypeError, ValueError):
+        return default
+    return max(0.001, value)
 
 
 class ReadTool(BaseTool):
@@ -427,9 +433,17 @@ def _bash_exe() -> str | None:
     return shutil.which("bash")
 
 
+def _default_shell() -> str:
+    if sys.platform.startswith("win"):
+        return "PowerShell"
+    if _bash_exe() is not None:
+        return "Bash"
+    return "PowerShell"
+
+
 class PowerShellTool(BaseTool):
     name = "PowerShell"
-    description = "Run a short non-interactive PowerShell command in the local working directory. Use ProcessStart for long-running or interactive commands."
+    description = "Run a short non-interactive PowerShell command in the local working directory. Use exec_command with tty=true for long-running or interactive commands."
     input_schema = _schema(
         {
             "command": {"type": "string"},
@@ -470,7 +484,7 @@ class PowerShellTool(BaseTool):
 
 class BashTool(BaseTool):
     name = "Bash"
-    description = "Run a short non-interactive Bash command in the local working directory. Use ProcessStart for long-running or interactive commands."
+    description = "Run a short non-interactive Bash command in the local working directory. Use exec_command with tty=true for long-running or interactive commands."
     input_schema = _schema(
         {
             "command": {"type": "string"},
@@ -576,10 +590,13 @@ class ProcessSession:
     args: list[str]
     cwd: str
     process: asyncio.subprocess.Process
+    tty: bool = True
+    stdin_authorized: bool = True
     created_at: float = field(default_factory=time.time)
     status: str = "running"
     returncode: int | None = None
     stdin_closed: bool = False
+    output_seq: int = 0
     stdout: _StreamBuffer = field(default_factory=_StreamBuffer)
     stderr: _StreamBuffer = field(default_factory=_StreamBuffer)
     output_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -611,12 +628,14 @@ class ProcessSessionManager:
         context: ToolContext,
         yield_time_ms: int,
         timeout_ms: int | None,
+        tty: bool = True,
+        output_idle_timeout_ms: int | None = None,
     ) -> tuple[ProcessSession, str, str]:
         args = _command_for_shell(shell, command)
         process = await asyncio.create_subprocess_exec(
             *args,
             cwd=str(cwd),
-            stdin=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if tty else subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             **_process_creation_kwargs(),
@@ -629,6 +648,9 @@ class ProcessSessionManager:
             args=args,
             cwd=str(cwd),
             process=process,
+            tty=tty,
+            stdin_authorized=tty,
+            stdin_closed=not tty,
             active_context=context,
             active_started_at=time.perf_counter(),
         )
@@ -641,7 +663,14 @@ class ProcessSessionManager:
         if timeout_ms is not None:
             session.timeout_task = asyncio.create_task(self._enforce_timeout(session, timeout_ms))
 
-        await self._collect_for(session, context, yield_time_ms)
+        if output_idle_timeout_ms is None:
+            await self._collect_for(session, context, yield_time_ms)
+        else:
+            await self._collect_until_idle(
+                session,
+                context,
+                output_idle_timeout_ms=output_idle_timeout_ms,
+            )
         return session, session.stdout.consume(), session.stderr.consume()
 
     def get(self, process_id: str) -> ProcessSession | None:
@@ -683,13 +712,16 @@ class ProcessSessionManager:
         chars: str,
         close_stdin: bool,
         yield_time_ms: int,
+        output_idle_timeout_ms: int | None = None,
     ) -> tuple[ProcessSession | None, str, str, str | None]:
         session = self.get(process_id)
         if session is None:
             return None, "", "", "process not found"
         error: str | None = None
         if chars:
-            if session.stdin_closed or session.process.stdin is None:
+            if not session.tty or not session.stdin_authorized:
+                error = "stdin is not enabled for this session"
+            elif session.stdin_closed or session.process.stdin is None:
                 error = "stdin is closed"
             else:
                 try:
@@ -703,7 +735,14 @@ class ProcessSessionManager:
             with suppress(Exception):
                 await session.process.stdin.wait_closed()
             session.stdin_closed = True
-        await self._collect_for(session, context, yield_time_ms)
+        if output_idle_timeout_ms is None:
+            await self._collect_for(session, context, yield_time_ms)
+        else:
+            await self._collect_until_idle(
+                session,
+                context,
+                output_idle_timeout_ms=output_idle_timeout_ms,
+            )
         return session, session.stdout.consume(), session.stderr.consume(), error
 
     async def stop(
@@ -752,6 +791,7 @@ class ProcessSessionManager:
                 session.stderr.append(text)
             else:
                 session.stdout.append(text)
+            session.output_seq += 1
             session.output_event.set()
             context = session.active_context
             if context is not None:
@@ -794,6 +834,78 @@ class ProcessSessionManager:
                     await asyncio.wait_for(session.exit_event.wait(), timeout=wait_ms / 1000)
         finally:
             self._deactivate(session, context)
+
+    async def _collect_until_idle(
+        self,
+        session: ProcessSession,
+        context: ToolContext,
+        *,
+        output_idle_timeout_ms: int,
+    ) -> None:
+        started_at = time.perf_counter()
+        deadline = started_at + (MAX_TOOL_WAIT_MS / 1000)
+        idle_seconds = max(0, output_idle_timeout_ms) / 1000
+        last_seen_seq = session.output_seq
+        last_output_at = started_at if session.has_pending_output() else None
+        await self._activate(session, context)
+        try:
+            while True:
+                if not session.is_running():
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(session.exit_event.wait(), timeout=0.05)
+                    return
+
+                now = time.perf_counter()
+                if now >= deadline:
+                    return
+                if last_output_at is not None and now - last_output_at >= idle_seconds:
+                    return
+
+                timeout_seconds = deadline - now
+                if last_output_at is not None:
+                    timeout_seconds = min(timeout_seconds, idle_seconds - (now - last_output_at))
+                else:
+                    timeout_seconds = min(timeout_seconds, idle_seconds)
+                timeout_seconds = max(0, timeout_seconds)
+
+                session.output_event.clear()
+                if session.output_seq != last_seen_seq:
+                    last_seen_seq = session.output_seq
+                    last_output_at = time.perf_counter()
+                    continue
+                if not session.is_running():
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        self._wait_for_session_signal(session),
+                        timeout=timeout_seconds,
+                    )
+                except TimeoutError:
+                    return
+
+                if session.output_seq != last_seen_seq:
+                    last_seen_seq = session.output_seq
+                    last_output_at = time.perf_counter()
+        finally:
+            self._deactivate(session, context)
+
+    async def _wait_for_session_signal(self, session: ProcessSession) -> None:
+        output_task = asyncio.create_task(session.output_event.wait())
+        exit_task = asyncio.create_task(session.exit_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {output_task, exit_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                task.result()
+        finally:
+            for task in (output_task, exit_task):
+                if not task.done():
+                    task.cancel()
 
     async def _wait_for_new_output(
         self,
@@ -841,8 +953,268 @@ def _format_process_result(
     return truncate_text(content.strip(), max_chars)
 
 
+def _combine_process_output(stdout: str, stderr: str) -> str:
+    content = stdout if stdout else ""
+    if stderr:
+        content = f"{content}\n[stderr]\n{stderr}".strip()
+    return content
+
+
+def _exec_timeout_ms(raw_input: JsonObject, *, tty: bool) -> int | None:
+    if raw_input.get("timeout_ms") is None:
+        return DEFAULT_TTY_TIMEOUT_MS if tty else DEFAULT_NON_TTY_TIMEOUT_MS
+    try:
+        return max(1, int(raw_input["timeout_ms"]))
+    except (TypeError, ValueError):
+        return DEFAULT_TTY_TIMEOUT_MS if tty else DEFAULT_NON_TTY_TIMEOUT_MS
+
+
+def _exec_output_idle_timeout_ms(raw_input: JsonObject) -> int:
+    return _coerce_ms(
+        raw_input,
+        "output_idle_timeout_ms",
+        default=DEFAULT_OUTPUT_IDLE_TIMEOUT_MS,
+        maximum=MAX_TOOL_WAIT_MS,
+    )
+
+
+def _exec_max_chars(raw_input: JsonObject, context: ToolContext) -> int:
+    try:
+        return max(1, int(raw_input.get("max_chars") or context.max_result_chars))
+    except (TypeError, ValueError):
+        return context.max_result_chars
+
+
+def _exec_result(
+    session: ProcessSession,
+    *,
+    stdout: str,
+    stderr: str,
+    context: ToolContext,
+    started_at: float,
+    max_chars: int,
+    success: bool | None = None,
+    error: str | None = None,
+) -> ToolResult:
+    output = truncate_text(_combine_process_output(stdout, stderr), max_chars)
+    data: JsonObject = {
+        "chunk_id": new_id("chunk"),
+        "wall_time_seconds": round(time.perf_counter() - started_at, 4),
+        "status": session.status,
+        "exit_code": session.returncode,
+        "session_id": session.process_id if session.is_running() else None,
+        "stdin_closed": session.stdin_closed,
+        "output": output,
+    }
+    if error:
+        data["error"] = error
+    if success is None:
+        success = error is None and session.status not in {"failed", "timed_out"}
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    return ToolResult(
+        success=success,
+        content=truncate_text(content, context.max_result_chars),
+        data=data,
+        error=None,
+    )
+
+
+def _exec_error_result(
+    message: str,
+    context: ToolContext,
+    *,
+    started_at: float,
+) -> ToolResult:
+    data: JsonObject = {
+        "chunk_id": new_id("chunk"),
+        "wall_time_seconds": round(time.perf_counter() - started_at, 4),
+        "status": "error",
+        "exit_code": None,
+        "session_id": None,
+        "stdin_closed": True,
+        "output": "",
+        "error": message,
+    }
+    return ToolResult(
+        success=False,
+        content=json.dumps(data, ensure_ascii=False, indent=2),
+        data=data,
+        error=None,
+    )
+
+
+class ExecCommandTool(BaseTool):
+    name = "exec_command"
+    description = (
+        "Runs a shell command and returns output. Set tty=true for long-running or "
+        "interactive commands; if the process remains active, pass the returned "
+        "session_id to write_stdin."
+    )
+    input_schema = _schema(
+        {
+            "cmd": {"type": "string", "description": "Shell command to execute."},
+            "workdir": {
+                "type": "string",
+                "description": "Optional working directory; defaults to the current cwd.",
+            },
+            "shell": {
+                "type": "string",
+                "enum": ["PowerShell", "Bash"],
+                "default": _default_shell(),
+            },
+            "tty": {
+                "type": "boolean",
+                "default": False,
+                "description": "Keep stdin open for follow-up write_stdin calls.",
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum process lifetime. If reached, the process is terminated.",
+            },
+            "output_idle_timeout_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_TOOL_WAIT_MS,
+                "default": DEFAULT_OUTPUT_IDLE_TIMEOUT_MS,
+                "description": "Return partial output after stdout/stderr has been quiet for this long. Does not terminate the process.",
+            },
+            "max_chars": {"type": "integer", "minimum": 1, "default": 12000},
+        },
+        required=["cmd"],
+    )
+
+    def is_read_only(self, raw_input: JsonObject) -> bool:
+        shell = str(raw_input.get("shell") or _default_shell())
+        command = str(raw_input.get("cmd") or "")
+        if shell == "Bash":
+            return analyze_bash(command).read_only
+        return analyze_powershell(command).read_only
+
+    def check_permissions(self, raw_input: JsonObject, context: ToolContext) -> PermissionResult:
+        del context
+        shell = str(raw_input.get("shell") or _default_shell())
+        command = str(raw_input.get("cmd") or "")
+        if shell == "Bash":
+            analysis = analyze_bash(command)
+        else:
+            analysis = analyze_powershell(command)
+        return PermissionResult.allow(reason=analysis.reason, source=analysis.parser)
+
+    async def run(self, raw_input: JsonObject, context: ToolContext) -> ToolResult:
+        started_at = time.perf_counter()
+        shell = str(raw_input.get("shell") or _default_shell())
+        command = str(raw_input["cmd"])
+        tty = bool(raw_input.get("tty"))
+        try:
+            session, stdout, stderr = await PROCESSES.start(
+                name=command,
+                shell=shell,
+                command=command,
+                cwd=_resolve_path(context, raw_input.get("workdir"), default="."),
+                context=context,
+                yield_time_ms=MAX_TOOL_WAIT_MS,
+                timeout_ms=_exec_timeout_ms(raw_input, tty=tty),
+                tty=tty,
+                output_idle_timeout_ms=_exec_output_idle_timeout_ms(raw_input),
+            )
+        except RuntimeError as exc:
+            return _exec_error_result(str(exc), context, started_at=started_at)
+        return _exec_result(
+            session,
+            stdout=stdout,
+            stderr=stderr,
+            context=context,
+            started_at=started_at,
+            max_chars=_exec_max_chars(raw_input, context),
+        )
+
+
+class WriteStdinTool(BaseTool):
+    name = "write_stdin"
+    description = (
+        "Writes characters to an active exec_command session and returns recent "
+        "output. Use chars=\"\" to poll without writing."
+    )
+    input_schema = _schema(
+        {
+            "session_id": {"type": "string"},
+            "chars": {"type": "string", "default": ""},
+            "close_stdin": {"type": "boolean", "default": False},
+            "output_idle_timeout_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_TOOL_WAIT_MS,
+                "default": DEFAULT_OUTPUT_IDLE_TIMEOUT_MS,
+                "description": "Return partial output after stdout/stderr has been quiet for this long. Does not terminate the process.",
+            },
+            "max_chars": {"type": "integer", "minimum": 1, "default": 12000},
+        },
+        required=["session_id"],
+    )
+
+    def is_read_only(self, raw_input: JsonObject) -> bool:
+        return not raw_input.get("chars") and not bool(raw_input.get("close_stdin"))
+
+    def check_permissions(self, raw_input: JsonObject, context: ToolContext) -> PermissionResult:
+        del context
+        if not raw_input.get("chars") and not bool(raw_input.get("close_stdin")):
+            return PermissionResult.allow(reason="polling process output", source="tool")
+        session = PROCESSES.get(str(raw_input.get("session_id") or ""))
+        if session is None:
+            return PermissionResult.deny(reason="process session not found", source="tool")
+        if not session.tty or not session.stdin_authorized:
+            return PermissionResult.deny(reason="stdin is not enabled for this session", source="tool")
+        return PermissionResult.allow(reason="stdin authorized by exec_command session", source="tool")
+
+    async def run(self, raw_input: JsonObject, context: ToolContext) -> ToolResult:
+        started_at = time.perf_counter()
+        session, stdout, stderr, error = await PROCESSES.write(
+            str(raw_input["session_id"]),
+            context=context,
+            chars=str(raw_input.get("chars") or ""),
+            close_stdin=bool(raw_input.get("close_stdin")),
+            yield_time_ms=MAX_TOOL_WAIT_MS,
+            output_idle_timeout_ms=_exec_output_idle_timeout_ms(raw_input),
+        )
+        if session is None:
+            return _exec_error_result(f"Process not found: {raw_input['session_id']}", context, started_at=started_at)
+        return _exec_result(
+            session,
+            stdout=stdout,
+            stderr=stderr,
+            context=context,
+            started_at=started_at,
+            max_chars=_exec_max_chars(raw_input, context),
+            success=error is None and session.status not in {"failed", "timed_out"},
+            error=error,
+        )
+
+
+class StopCommandTool(BaseTool):
+    name = "stop_command"
+    description = "Stops a running exec_command session."
+    input_schema = _schema({"session_id": {"type": "string"}}, required=["session_id"])
+
+    async def run(self, raw_input: JsonObject, context: ToolContext) -> ToolResult:
+        started_at = time.perf_counter()
+        session, stdout, stderr = await PROCESSES.stop(str(raw_input["session_id"]), context=context)
+        if session is None:
+            return _exec_error_result(f"Process not found: {raw_input['session_id']}", context, started_at=started_at)
+        return _exec_result(
+            session,
+            stdout=stdout,
+            stderr=stderr,
+            context=context,
+            started_at=started_at,
+            max_chars=context.max_result_chars,
+            success=True,
+        )
+
+
 class ProcessStartTool(BaseTool):
     name = "ProcessStart"
+    model_visible = False
     description = "Start a long-running or interactive local shell process and return a process_id for later ProcessRead, ProcessWrite, or ProcessStop calls."
     input_schema = _schema(
         {
@@ -898,6 +1270,7 @@ class ProcessStartTool(BaseTool):
 
 class ProcessReadTool(BaseTool):
     name = "ProcessRead"
+    model_visible = False
     description = "Read new stdout and stderr from a process session started by ProcessStart."
     read_only = True
     input_schema = _schema(
@@ -932,6 +1305,7 @@ class ProcessReadTool(BaseTool):
 
 class ProcessWriteTool(BaseTool):
     name = "ProcessWrite"
+    model_visible = False
     description = "Write stdin to a running process session, optionally close stdin, and read new output."
     input_schema = _schema(
         {
@@ -969,6 +1343,7 @@ class ProcessWriteTool(BaseTool):
 
 class ProcessStopTool(BaseTool):
     name = "ProcessStop"
+    model_visible = False
     description = "Stop a running process session and kill its process tree if needed."
     input_schema = _schema({"process_id": {"type": "string"}}, required=["process_id"])
 
@@ -1112,8 +1487,6 @@ class WebSearchTool(BaseTool):
         {
             "query": {"type": "string"},
             "timeout_ms": {"type": "number", "minimum": 1, "default": 10000},
-            "timeout": {"type": "number", "minimum": 0.001, "default": 10},
-            "timeout_seconds": {"type": "number", "minimum": 0.001, "default": 10},
         },
         required=["query"],
     )
@@ -1167,8 +1540,6 @@ class WebFetchTool(BaseTool):
             "raw": {"type": "boolean", "default": False},
             "max_chars": {"type": "integer", "minimum": 1, "default": 20000},
             "timeout_ms": {"type": "number", "minimum": 1, "default": 10000},
-            "timeout": {"type": "number", "minimum": 0.001, "default": 10},
-            "timeout_seconds": {"type": "number", "minimum": 0.001, "default": 10},
         },
         required=["url"],
     )
@@ -1840,6 +2211,9 @@ def register_builtin_tools(registry: Any) -> None:
         EditTool(),
         WriteTool(),
         NotebookEditTool(),
+        ExecCommandTool(),
+        WriteStdinTool(),
+        StopCommandTool(),
         ProcessStartTool(),
         ProcessReadTool(),
         ProcessWriteTool(),
@@ -1872,7 +2246,7 @@ def register_builtin_tools(registry: Any) -> None:
     for tool in tools:
         registry.register(tool)
 
-    registry.register(ToolSearchTool(registry.get_tools, registry.get_aliases))
+    registry.register(ToolSearchTool(registry.get_model_tools, registry.get_aliases))
     registry.register(WorkflowTool(lambda: registry))
 
     aliases = {

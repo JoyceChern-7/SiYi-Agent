@@ -46,6 +46,9 @@ def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:
         "Edit",
         "Write",
         "NotebookEdit",
+        "exec_command",
+        "write_stdin",
+        "stop_command",
         "ProcessStart",
         "ProcessRead",
         "ProcessWrite",
@@ -78,9 +81,12 @@ def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:
     if sys.platform.startswith("win"):
         expected.add("PowerShell")
     assert expected <= names
+    legacy_process_tools = {"ProcessStart", "ProcessRead", "ProcessWrite", "ProcessStop"}
+    model_expected = expected - legacy_process_tools
     assert alias_names.isdisjoint(names)
     assert alias_names.isdisjoint(model_tool_names)
-    assert expected <= model_tool_names
+    assert model_expected <= model_tool_names
+    assert legacy_process_tools.isdisjoint(model_tool_names)
 
 
 def test_registry_resolves_aliases_without_exposing_them_to_model(tmp_path: Path) -> None:
@@ -141,18 +147,25 @@ def test_io_tools_expose_timeout_ms_and_default_to_ten_seconds(tmp_path: Path) -
             continue
         properties = tool.input_schema["properties"]
         assert properties["timeout_ms"]["default"] == 10000
+        assert "timeout_seconds" not in properties
+        assert "timeout" not in properties
         if tool_name in {"PowerShell", "Bash"}:
-            assert "timeout_seconds" not in properties
-            assert "timeout" not in properties
             assert "input" not in properties
             assert "run_in_background" not in properties
-        else:
-            assert properties["timeout_seconds"]["default"] == 10
-            assert properties["timeout"]["default"] == 10
 
     assert builtin_module._timeout_seconds({}) == 10
-    assert builtin_module._timeout_seconds({"timeout": 120, "timeout_ms": 30_000}) == 30
-    assert builtin_module._timeout_seconds({"timeout_seconds": 45}) == 45
+    assert builtin_module._timeout_seconds({"timeout_ms": 30_000}) == 30
+    assert builtin_module._timeout_seconds({"timeout": 120}) == 10
+    assert builtin_module._timeout_seconds({"timeout_seconds": 45}) == 10
+
+    context = _context(tmp_path)
+    validation = web_search.validate_input({"query": "x", "timeout": 1}, context)
+    assert not validation.ok
+    validation = web_fetch.validate_input(
+        {"url": "https://example.com", "timeout_seconds": 1},
+        context,
+    )
+    assert not validation.ok
 
 
 def test_file_tools_are_callable(tmp_path: Path) -> None:
@@ -346,6 +359,148 @@ def test_process_session_supports_stdin_and_stop(tmp_path: Path) -> None:
     assert stopped.data["status"] in {"stopped", "timed_out", "failed", "completed"}
 
 
+def test_exec_command_supports_idle_stdin_poll_and_stop(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    shell = _available_shell(runtime)
+    if shell is None:
+        return
+    script = tmp_path / "exec_interactive.py"
+    script.write_text(
+        "import sys, time\n"
+        "print('ready', flush=True)\n"
+        "line = sys.stdin.readline().strip()\n"
+        "print('got:' + line, flush=True)\n"
+        "time.sleep(0.3)\n"
+        "print('later', flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    context = _context(tmp_path)
+    exec_tool = runtime.tool_registry.find_tool("exec_command")
+    write_tool = runtime.tool_registry.find_tool("write_stdin")
+    stop_tool = runtime.tool_registry.find_tool("stop_command")
+    assert exec_tool is not None and write_tool is not None and stop_tool is not None
+
+    async def run_session() -> tuple[dict, dict, dict, dict]:
+        started_result = await exec_tool.run(
+            {
+                "shell": shell,
+                "cmd": _script_command(script, shell),
+                "tty": True,
+                "output_idle_timeout_ms": 1000,
+                "timeout_ms": 5000,
+            },
+            context,
+        )
+        started = json.loads(started_result.content)
+        written_result = await write_tool.run(
+            {
+                "session_id": started["session_id"],
+                "chars": "yes\n",
+                "output_idle_timeout_ms": 100,
+            },
+            context,
+        )
+        written = json.loads(written_result.content)
+        polled_result = await write_tool.run(
+            {
+                "session_id": started["session_id"],
+                "chars": "",
+                "output_idle_timeout_ms": 500,
+            },
+            context,
+        )
+        polled = json.loads(polled_result.content)
+        stopped_result = await stop_tool.run({"session_id": started["session_id"]}, context)
+        stopped = json.loads(stopped_result.content)
+        return started, written, polled, stopped
+
+    started, written, polled, stopped = asyncio.run(run_session())
+
+    assert started["session_id"]
+    assert started["status"] == "running"
+    assert "ready" in started["output"]
+    assert "got:yes" in written["output"]
+    assert "later" in polled["output"]
+    assert stopped["session_id"] is None
+    assert stopped["status"] in {"stopped", "timed_out", "failed", "completed"}
+
+
+def test_exec_command_non_tty_closes_stdin_and_timeout_kills(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    shell = _available_shell(runtime)
+    if shell is None:
+        return
+    context = _context(tmp_path)
+    exec_tool = runtime.tool_registry.find_tool("exec_command")
+    write_tool = runtime.tool_registry.find_tool("write_stdin")
+    stop_tool = runtime.tool_registry.find_tool("stop_command")
+    assert exec_tool is not None and write_tool is not None and stop_tool is not None
+    stdin_script = tmp_path / "exec_stdin_check.py"
+    stdin_script.write_text(
+        "import sys\n"
+        "data = sys.stdin.readline()\n"
+        "print('stdin_closed' if data == '' else 'stdin_open', flush=True)\n",
+        encoding="utf-8",
+    )
+    sleep_script = tmp_path / "exec_sleep.py"
+    sleep_script.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+
+    async def run_checks() -> tuple[dict, dict, dict]:
+        closed_result = await exec_tool.run(
+            {
+                "shell": shell,
+                "cmd": _script_command(stdin_script, shell),
+                "tty": False,
+                "output_idle_timeout_ms": 1000,
+                "timeout_ms": 3000,
+            },
+            context,
+        )
+        non_tty_running_result = await exec_tool.run(
+            {
+                "shell": shell,
+                "cmd": _script_command(sleep_script, shell),
+                "tty": False,
+                "output_idle_timeout_ms": 100,
+                "timeout_ms": 5000,
+            },
+            context,
+        )
+        non_tty_running = json.loads(non_tty_running_result.content)
+        non_tty_write_result = await write_tool.run(
+            {
+                "session_id": non_tty_running["session_id"],
+                "chars": "x\n",
+                "output_idle_timeout_ms": 100,
+            },
+            context,
+        )
+        await stop_tool.run({"session_id": non_tty_running["session_id"]}, context)
+        timed_result = await exec_tool.run(
+            {
+                "shell": shell,
+                "cmd": _script_command(sleep_script, shell),
+                "tty": True,
+                "output_idle_timeout_ms": 1000,
+                "timeout_ms": 100,
+            },
+            context,
+        )
+        return (
+            json.loads(closed_result.content),
+            json.loads(non_tty_write_result.content),
+            json.loads(timed_result.content),
+        )
+
+    closed, non_tty_write, timed = asyncio.run(run_checks())
+
+    assert closed["session_id"] is None
+    assert "stdin_closed" in closed["output"]
+    assert non_tty_write["error"] == "stdin is not enabled for this session"
+    assert timed["status"] == "timed_out"
+
+
 def test_project_management_and_lookup_tools_are_callable(tmp_path: Path) -> None:
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
     context = _context(tmp_path)
@@ -470,6 +625,20 @@ def test_tool_search_finds_hidden_aliases(tmp_path: Path) -> None:
     assert result.data["tools"][0]["name"] == "Read"
     assert "read_file" in result.data["tools"][0]["aliases"]
     assert "Read (aliases: read_file)" in result.content
+
+
+def test_tool_search_hides_legacy_process_tools(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    context = _context(tmp_path)
+    tool_search = runtime.tool_registry.find_tool("ToolSearch")
+    assert tool_search is not None
+
+    result = asyncio.run(tool_search.run({"query": "ProcessStart"}, context))
+
+    assert result.success
+    assert result.data is not None
+    assert result.data["tools"] == []
+    assert "ProcessStart" not in result.content
 
 
 class ToolCallingLLM(LLMAdapter):
