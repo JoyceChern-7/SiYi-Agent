@@ -158,7 +158,7 @@ Notable tools include:
 - `Read`, `Write`, `Edit`, `NotebookEdit`
 - `Glob`, `Grep`
 - `PowerShell`, `Bash`
-- `ProcessStart`, `ProcessRead`, `ProcessWrite`, `ProcessStop`
+- `exec_command`, `write_stdin`, `stop_command`
 - `WebSearch`, `WebFetch`
 - `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`
 - `Skill`
@@ -169,7 +169,7 @@ Notable tools include:
 Short commands should use `PowerShell` or `Bash`. Long-running or interactive commands should use process sessions:
 
 ```text
-ProcessStart -> ProcessRead -> ProcessWrite -> ProcessStop
+exec_command -> write_stdin -> stop_command
 ```
 
 This design keeps normal shell calls short and predictable while still supporting stdin-driven interactive flows.

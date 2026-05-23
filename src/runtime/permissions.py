@@ -348,7 +348,7 @@ class PermissionManager:
     @staticmethod
     def _is_shell_tool(tool_name: str, tool_input: dict[str, Any] | None = None) -> bool:
         del tool_input
-        return tool_name in {"shell", "Bash", "PowerShell", "ProcessStart", "exec_command"}
+        return tool_name in {"shell", "Bash", "PowerShell", "exec_command"}
 
 
 def load_permission_config(cwd: Path | None) -> PermissionConfig:
@@ -397,7 +397,6 @@ def _default_permission_rules() -> PermissionRules:
             "WebSearch(*)",
             "WebFetch(*)",
             "ToolSearch(*)",
-            "ProcessRead(*)",
             "TaskGet(*)",
             "TaskList(*)",
             "Skill(*)",
@@ -416,9 +415,6 @@ def _default_permission_rules() -> PermissionRules:
             "Bash(*)",
             "PowerShell(*)",
             "exec_command(*)",
-            "ProcessStart(*)",
-            "ProcessWrite(*)",
-            "ProcessStop(*)",
             "Write(*)",
             "Edit(*)",
             "NotebookEdit(*)",
@@ -536,7 +532,7 @@ def _combine_permissions(*results: PermissionResult) -> PermissionResult:
 
 
 def _permission_payload(tool_name: str, tool_input: dict[str, Any]) -> str:
-    if tool_name in {"Bash", "PowerShell", "ProcessStart", "shell", "exec_command"}:
+    if tool_name in {"Bash", "PowerShell", "shell", "exec_command"}:
         return str(tool_input.get("command") or tool_input.get("cmd") or "*")
     if tool_name in {"write_stdin", "stop_command"}:
         return str(tool_input.get("session_id") or "*")
@@ -571,7 +567,6 @@ def _is_default_read_tool(tool_name: str, tool_input: dict[str, Any]) -> bool:
         "WebSearch",
         "WebFetch",
         "ToolSearch",
-        "ProcessRead",
         "write_stdin",
         "stop_command",
         "TaskGet",

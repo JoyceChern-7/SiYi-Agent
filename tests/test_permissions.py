@@ -86,10 +86,6 @@ def test_default_process_session_permissions(tmp_path: Path, monkeypatch: pytest
     manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
 
     assert manager.check("exec_command", {"cmd": "Get-ChildItem"}).decision == "allow"
-    assert manager.check("ProcessStart", {"command": "npm run dev"}).decision == "ask"
-    assert manager.check("ProcessRead", {"process_id": "proc_test"}).decision == "allow"
-    assert manager.check("ProcessWrite", {"process_id": "proc_test", "chars": "y\n"}).decision == "ask"
-    assert manager.check("ProcessStop", {"process_id": "proc_test"}).decision == "ask"
     assert manager.check("write_stdin", {"session_id": "proc_test", "chars": ""}).decision == "allow"
     assert manager.check("stop_command", {"session_id": "proc_test"}).decision == "allow"
 

@@ -49,10 +49,6 @@ def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:
         "exec_command",
         "write_stdin",
         "stop_command",
-        "ProcessStart",
-        "ProcessRead",
-        "ProcessWrite",
-        "ProcessStop",
         "Glob",
         "Grep",
         "WebSearch",
@@ -81,12 +77,9 @@ def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:
     if sys.platform.startswith("win"):
         expected.add("PowerShell")
     assert expected <= names
-    legacy_process_tools = {"ProcessStart", "ProcessRead", "ProcessWrite", "ProcessStop"}
-    model_expected = expected - legacy_process_tools
     assert alias_names.isdisjoint(names)
     assert alias_names.isdisjoint(model_tool_names)
-    assert model_expected <= model_tool_names
-    assert legacy_process_tools.isdisjoint(model_tool_names)
+    assert expected <= model_tool_names
 
 
 def test_registry_resolves_aliases_without_exposing_them_to_model(tmp_path: Path) -> None:
@@ -302,61 +295,6 @@ def test_shell_tool_timeout_returns_timed_out(tmp_path: Path) -> None:
     assert not result.success
     assert result.data is not None
     assert result.data["timed_out"] is True
-
-
-def test_process_session_supports_stdin_and_stop(tmp_path: Path) -> None:
-    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
-    shell = _available_shell(runtime)
-    if shell is None:
-        return
-    script = tmp_path / "interactive.py"
-    script.write_text(
-        "import sys, time\n"
-        "print('ready', flush=True)\n"
-        "line = sys.stdin.readline().strip()\n"
-        "print('got:' + line, flush=True)\n"
-        "time.sleep(30)\n",
-        encoding="utf-8",
-    )
-    context = _context(tmp_path)
-    start = runtime.tool_registry.find_tool("ProcessStart")
-    write = runtime.tool_registry.find_tool("ProcessWrite")
-    stop = runtime.tool_registry.find_tool("ProcessStop")
-    assert start is not None and write is not None and stop is not None
-
-    async def run_session() -> tuple[ToolResult, ToolResult, ToolResult]:
-        started_result = await start.run(
-            {
-                "shell": shell,
-                "command": _script_command(script, shell),
-                "yield_time_ms": 1500,
-            },
-            context,
-        )
-        assert started_result.data is not None
-        process_id = started_result.data["process_id"]
-        written_result = await write.run(
-            {
-                "process_id": process_id,
-                "chars": "yes\n",
-                "yield_time_ms": 300,
-            },
-            context,
-        )
-        stopped_result = await stop.run({"process_id": process_id}, context)
-        return started_result, written_result, stopped_result
-
-    started, written, stopped = asyncio.run(run_session())
-
-    assert started.success
-    assert "ready" in started.content
-    assert started.data is not None
-    assert written.success
-    assert "got:yes" in written.content
-
-    assert stopped.success
-    assert stopped.data is not None
-    assert stopped.data["status"] in {"stopped", "timed_out", "failed", "completed"}
 
 
 def test_exec_command_supports_idle_stdin_poll_and_stop(tmp_path: Path) -> None:
@@ -627,7 +565,7 @@ def test_tool_search_finds_hidden_aliases(tmp_path: Path) -> None:
     assert "Read (aliases: read_file)" in result.content
 
 
-def test_tool_search_hides_legacy_process_tools(tmp_path: Path) -> None:
+def test_tool_search_does_not_find_removed_process_tools(tmp_path: Path) -> None:
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
     context = _context(tmp_path)
     tool_search = runtime.tool_registry.find_tool("ToolSearch")

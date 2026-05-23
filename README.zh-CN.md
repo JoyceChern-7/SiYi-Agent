@@ -161,7 +161,7 @@ SiYi 只把 canonical tool schema 暴露给模型，alias 在本地解析。这�
 - `Read`, `Write`, `Edit`, `NotebookEdit`
 - `Glob`, `Grep`
 - `PowerShell`, `Bash`
-- `ProcessStart`, `ProcessRead`, `ProcessWrite`, `ProcessStop`
+- `exec_command`, `write_stdin`, `stop_command`
 - `WebSearch`, `WebFetch`
 - `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`
 - `Skill`
@@ -172,7 +172,7 @@ SiYi 只把 canonical tool schema 暴露给模型，alias 在本地解析。这�
 短命令应该使用 `PowerShell` 或 `Bash`。长时间运行、需要 stdin、需要多次读取输出的命令应该使用 process session：
 
 ```text
-ProcessStart -> ProcessRead -> ProcessWrite -> ProcessStop
+exec_command -> write_stdin -> stop_command
 ```
 
 这种设计避免普通 shell tool 被交互式命令卡住，同时保留了处理复杂终端流程的能力。
