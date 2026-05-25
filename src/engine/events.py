@@ -46,6 +46,14 @@ class ToolOutputDeltaEvent(QueryEvent):
     elapsed_ms: int = 0
 
 
+class PermissionRequestEvent(QueryEvent):
+    type: Literal["permission_request"] = "permission_request"
+    approval_id: str
+    tool_name: str
+    tool_input: dict[str, Any]
+    project_root: str
+
+
 class StatusEvent(QueryEvent):
     type: Literal["status"] = "status"
     message: str

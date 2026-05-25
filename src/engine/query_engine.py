@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import asyncio
 from dataclasses import dataclass
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -22,6 +22,7 @@ from engine.message_schema import (
     user_message,
 )
 from engine.query_loop import DefaultQueryLoop, QueryLoop
+from engine.session_title import SessionTitleAgent, fallback_session_title, normalize_session_title
 from engine.turn_state import QueryTurnState
 from llm.base import LLMAdapter
 from runtime.compaction import CompactionManager, CompactionResult
@@ -42,11 +43,12 @@ LOGGER = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class SessionSnapshot:
     session_id: str
-    cwd: str
+    name: str
+    name_status: str
+    project_root: str
     project_id: str
     project_state_dir: str
     session_path: str
-    model: str
     turn_count: int
     message_count: int
     completed_turns: int
@@ -91,6 +93,8 @@ class QueryEngine:
         self.token_budget = token_budget
         self.usage_tracker = usage_tracker
         self.query_loop = query_loop or DefaultQueryLoop()
+        self.title_agent = SessionTitleAgent(llm)
+        self._title_task: asyncio.Task[None] | None = None
         self.mutable_messages: list[Message] = list(session.messages)
         self.last_error: str | None = None
         self.current_turn: QueryTurnState | None = None
@@ -113,6 +117,8 @@ class QueryEngine:
             return
 
         self.last_error = None
+        if self.session.metadata.name_status == "pending" and self.turn_counter == 0:
+            self._start_title_task(prompt)
         user_msg = self._build_user_message(prompt)
         turn = self._create_turn_state(prompt, user_msg)
         self.current_turn = turn
@@ -151,7 +157,7 @@ class QueryEngine:
                 temperature=self.settings.model.temperature,
                 tool_registry=self.tool_registry,
                 tool_context=ToolContext(
-                    cwd=str(self.settings.runtime.cwd),
+                    project_root=self.project_root,
                     trace_id=turn.turn_id,
                     session_id=turn.session_id,
                     turn_id=turn.turn_id,
@@ -260,9 +266,9 @@ class QueryEngine:
 
     async def new_session(self) -> SessionSnapshot:
         await self._clear_process_sessions()
+        project = self.session_store.project_store.ensure_project(self.settings.runtime.project_root)
         session = self.session_store.create_session(
-            cwd=self.settings.runtime.cwd,
-            model=self.settings.model.model,
+            project=project,
             permission_mode=load_global_permission_mode(),
         )
         self._activate_session(session)
@@ -272,19 +278,17 @@ class QueryEngine:
         metadata = self.session_store.get_metadata(session_id)
         if metadata is None:
             raise ValueError(f"Session not found: {session_id}")
-        if metadata.legacy or not metadata.cwd:
-            raise ValueError(f"Session has no cwd metadata: {session_id}")
-
-        cwd = Path(metadata.cwd).expanduser().resolve()
-        if not cwd.exists() or not cwd.is_dir():
-            raise ValueError(f"Session working directory does not exist: {cwd}")
+        project = self.session_store.get_project_for_session(metadata)
+        if project is None:
+            raise ValueError(f"Session has no project metadata: {session_id}")
+        project_root = Path(project.project_root).expanduser().resolve()
+        if not project_root.exists() or not project_root.is_dir():
+            raise ValueError(f"Session project root does not exist: {project_root}")
 
         session = self.session_store.switch_session(session_id)
         await self._clear_process_sessions()
-        os.chdir(cwd)
-        os.environ["SIYI_CWD"] = str(cwd)
-        self.settings.runtime.cwd = cwd
-        self.permission_manager.reload_for_cwd(cwd, mode=metadata.permission_mode)
+        self.settings.runtime.project_root = project_root
+        self.permission_manager.reload_for_project_root(project_root, mode=metadata.permission_mode)
         self._activate_session(session)
         return self.get_session_snapshot()
 
@@ -325,7 +329,7 @@ class QueryEngine:
             trigger="auto" if trigger == "auto" else "manual",
             custom_instructions=custom_instructions,
             transcript_path=str(self.session.path),
-            cwd=self.settings.runtime.cwd,
+            project_root=Path(self.project_root),
         )
 
     def _build_messages_for_query(self, messages: list[Message]) -> list[Message]:
@@ -442,6 +446,47 @@ class QueryEngine:
         self.turn_counter = self._derive_turn_counter()
         self.auto_compact_failures = 0
         self.usage_tracker.rebuild_from_messages(self.mutable_messages)
+        project = self.session_store.get_project_for_session(session.metadata)
+        if project is not None:
+            self.settings.runtime.project_root = Path(project.project_root).expanduser().resolve()
+
+    @property
+    def project_root(self) -> str:
+        project = self.session_store.get_project_for_session(self.session.metadata)
+        if project is None:
+            return str(self.settings.runtime.project_root)
+        return project.project_root
+
+    @property
+    def project_state_dir(self) -> str:
+        project = self.session_store.get_project_for_session(self.session.metadata)
+        return project.project_state_dir if project is not None else ""
+
+    def _start_title_task(self, first_user_input: str) -> None:
+        if self._title_task is not None and not self._title_task.done():
+            return
+        self._title_task = asyncio.create_task(self._name_session(self.session, first_user_input))
+
+    async def _name_session(self, session: SessionHandle, first_user_input: str) -> None:
+        try:
+            title = normalize_session_title(await self.title_agent.generate(first_user_input))
+            if not title:
+                raise ValueError("empty generated title")
+        except Exception as exc:  # noqa: BLE001 - title generation must not fail the user turn
+            LOGGER.debug("query_engine.session_title_failed", exc_info=exc)
+            title = fallback_session_title(first_user_input)
+        try:
+            self.session_store.set_generated_name(session, title)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("query_engine.session_title_persist_failed", exc_info=exc)
+
+    async def wait_for_title_task(self) -> None:
+        if self._title_task is not None:
+            await self._title_task
+
+    async def interrupt_turn(self, turn_id: str) -> None:
+        del turn_id
+        raise NotImplementedError("turn interruption is not implemented yet")
 
     async def _clear_process_sessions(self) -> None:
         from tools.builtin import PROCESSES
@@ -481,11 +526,12 @@ class QueryEngine:
         total_usage = self.usage_tracker.get_total_usage()
         return SessionSnapshot(
             session_id=self.session.session_id,
-            cwd=str(self.settings.runtime.cwd),
+            name=self.session.metadata.name,
+            name_status=self.session.metadata.name_status,
+            project_root=self.project_root,
             project_id=self.session.metadata.project_id,
-            project_state_dir=self.session.metadata.project_state_dir,
+            project_state_dir=self.project_state_dir,
             session_path=str(self.session.path),
-            model=self.settings.model.model,
             turn_count=self.turn_counter,
             message_count=len(self.mutable_messages),
             completed_turns=len(self.usage_tracker.get_turn_history()),

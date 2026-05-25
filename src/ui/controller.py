@@ -54,8 +54,8 @@ class REPLController:
             CommandSpec("compact", "/compact [instructions]", "Compact the current session context."),
             CommandSpec("session", "/session", "Show the current session summary."),
             CommandSpec("sessions", "/sessions", "List global sessions."),
-            CommandSpec("session_new", "/session_new", "Start a new global session for the current cwd."),
-            CommandSpec("session_switch", "/session_switch <session_id>", "Switch to a global session and follow its cwd."),
+            CommandSpec("session_new", "/session_new", "Start a new global session for the current project."),
+            CommandSpec("session_switch", "/session_switch <session_id>", "Switch to a global session and follow its project."),
             CommandSpec("permission", "/permission [--global] <default|full|custom>", "Show or change the permission mode."),
             CommandSpec("history", "/history [count]", "Show recent transcript messages."),
             CommandSpec("retry", "/retry", "Resubmit the most recent user prompt."),
@@ -71,8 +71,8 @@ class REPLController:
         snapshot = self.engine.get_session_snapshot()
         self.renderer.render_welcome(
             session_id=snapshot.session_id,
-            cwd=snapshot.cwd,
-            model=snapshot.model,
+            project_root=snapshot.project_root,
+            model=self.engine.settings.model.model,
         )
 
     async def handle(self, parsed: ParsedInput) -> bool:
@@ -131,7 +131,7 @@ class REPLController:
                 self.renderer.render_error(f"failed to switch session: {exc}")
                 return True
             self.renderer.render_note(
-                f"switched to session: {snapshot.session_id} cwd={snapshot.cwd}"
+                f"switched to session: {snapshot.session_id} project_root={snapshot.project_root}"
             )
             return True
         if command == "permission":
@@ -300,10 +300,11 @@ class REPLController:
         if self.prompt_io is None:
             return False
         async with self._permission_prompt_lock:
+            tool_input = json.dumps(request.tool_input, ensure_ascii=False, indent=2)
             self.renderer.render_note(
-                f"permission request: {request.summary}\n"
-                f"reason: {request.reason}\n"
-                f"cwd: {request.cwd}"
+                f"permission request: {request.tool_name}\n"
+                f"tool_input: {tool_input}\n"
+                f"project_root: {request.project_root}"
             )
             choice = await self.prompt_io.choice(
                 "Allow this tool call",

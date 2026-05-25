@@ -159,7 +159,7 @@ __all__ = [
     "_coerce_source",
     "_combine_process_output",
     "_command_for_shell",
-    "_cwd",
+    "_project_root",
     "_dedupe_skill_roots",
     "_default_shell",
     "_discover_skills",

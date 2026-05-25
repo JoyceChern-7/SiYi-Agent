@@ -45,7 +45,7 @@ def test_build_runtime_wires_core_services_for_internal_worker(
     options = parse_args(["--cwd", str(tmp_path), "--internal-worker-prompt", "hello"])
     runtime = build_runtime(options)
 
-    assert runtime.settings.runtime.cwd == tmp_path.resolve()
+    assert runtime.settings.runtime.project_root == tmp_path.resolve()
     assert runtime.settings.runtime.session_dir == (
         home.resolve() / ".siyi" / "sessions"
     )

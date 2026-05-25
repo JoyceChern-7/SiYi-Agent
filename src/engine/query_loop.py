@@ -143,10 +143,10 @@ class DefaultQueryLoop:
                         tool_registry,
                         tool_context,
                     ):
-                        if isinstance(item, ToolOutputDeltaEvent):
-                            yield item
-                        else:
+                        if isinstance(item, _ToolBatchExecutionResult):
                             result_blocks = item.result_blocks
+                        else:
+                            yield item
                 else:
                     for block in batch.blocks:
                         async for item in _execute_tool_batch(
@@ -154,10 +154,10 @@ class DefaultQueryLoop:
                             tool_registry,
                             tool_context,
                         ):
-                            if isinstance(item, ToolOutputDeltaEvent):
-                                yield item
-                            else:
+                            if isinstance(item, _ToolBatchExecutionResult):
                                 result_blocks.extend(item.result_blocks)
+                            else:
+                                yield item
 
                 for block, result_block in zip(batch.blocks, result_blocks, strict=True):
                     result_message = tool_result_message(
@@ -294,8 +294,8 @@ async def _execute_tool_batch(
     blocks: list[ToolUseBlock],
     tool_registry: ToolRegistry | None,
     tool_context: ToolContext | None,
-) -> AsyncIterator[ToolOutputDeltaEvent | _ToolBatchExecutionResult]:
-    progress_queue: asyncio.Queue[ToolOutputDeltaEvent] = asyncio.Queue()
+) -> AsyncIterator[QueryEvent | _ToolBatchExecutionResult]:
+    progress_queue: asyncio.Queue[QueryEvent] = asyncio.Queue()
     task = asyncio.gather(
         *[
             _execute_tool(

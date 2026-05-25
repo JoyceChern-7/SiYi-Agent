@@ -12,7 +12,7 @@ namespace: 一个 argparse.ArgumentParser 用于解析命令行参数并将它�
 - resume: string or bool(可选, 如果提供了 id, 则表示通过 id 恢复先前的会话. 如果没有提供 id, 则恢复最新的会话, 如果没有提供参数, 则不恢复任何会话)
 - debug: bool(可选, 表示是否启用调试日志记录)
 - print-thinking: bool(可选, 表示是否打印 model 的 CoT)
-- cwd: Path(可选, 工具和会话上下文的工作目录)
+- cwd: Path(可选, 兼容参数, 作为 project_root 使用)
 - version: 显示版本信息并退出
 
 CLIOptions: 一个 dataclass, 包含从命令行参数解析的选项字段.
@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cwd",
         type=Path,
-        help="Working directory for tools and session context.",
+        help="Project root for tools and session context.",
     )
     parser.add_argument(
         "--internal-worker-prompt",

@@ -47,7 +47,7 @@ class ToolSettings(BaseModel):
 
 
 class RuntimeSettings(BaseModel):
-    cwd: Path
+    project_root: Path
     debug: bool = False
     non_interactive: bool = False
     initial_prompt: str | None = None
@@ -58,7 +58,7 @@ class RuntimeSettings(BaseModel):
     compaction_enabled: bool = True
     auto_compact_enabled: bool = True
 
-    @field_validator("cwd", "session_dir")
+    @field_validator("project_root", "session_dir")
     @classmethod
     def expand_paths(cls, value: Path) -> Path:
         return value.expanduser().resolve()
@@ -110,7 +110,7 @@ def _env_truthy(*names: str) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def load_settings(options, cwd: Path) -> AppSettings:
+def load_settings(options, project_root: Path) -> AppSettings:
     user_settings = load_user_settings()
     env = EnvSettings()
     default_model_settings = ModelSettings()
@@ -147,7 +147,7 @@ def load_settings(options, cwd: Path) -> AppSettings:
     tier_model = resolve_model_from_tier(user_settings, model_tier)
 
     runtime = RuntimeSettings(
-        cwd=cwd,
+        project_root=project_root,
         debug=bool(options.debug or env.debug),
         non_interactive=bool(options.internal_worker),
         initial_prompt=options.prompt,

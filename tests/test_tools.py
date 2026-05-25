@@ -19,7 +19,7 @@ import tools.builtin as builtin_module
 
 
 def _context(tmp_path: Path) -> ToolContext:
-    return ToolContext(cwd=str(tmp_path), trace_id="test", max_result_chars=20_000)
+    return ToolContext(project_root=str(tmp_path), trace_id="test", max_result_chars=20_000)
 
 
 def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:

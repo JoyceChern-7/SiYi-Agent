@@ -31,7 +31,7 @@ class PowerShellTool(BaseTool):
         timeout = _timeout_seconds(raw_input)
         return_code, stdout, stderr, timed_out = await _run_process(
             args,
-            cwd=_cwd(context),
+            cwd=_project_root(context),
             timeout_seconds=timeout,
             context=context,
         )
@@ -71,7 +71,7 @@ class BashTool(BaseTool):
         timeout = _timeout_seconds(raw_input)
         return_code, stdout, stderr, timed_out = await _run_process(
             args,
-            cwd=_cwd(context),
+            cwd=_project_root(context),
             timeout_seconds=timeout,
             context=context,
         )
@@ -95,7 +95,7 @@ class ExecCommandTool(BaseTool):
             "cmd": {"type": "string", "description": "Shell command to execute."},
             "workdir": {
                 "type": "string",
-                "description": "Optional working directory; defaults to the current cwd.",
+                "description": "Optional working directory; defaults to the project root.",
             },
             "shell": {
                 "type": "string",

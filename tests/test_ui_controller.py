@@ -14,11 +14,12 @@ from ui.input_parser import parse_input
 @dataclass(slots=True)
 class _Snapshot:
     session_id: str = "sess_test"
-    cwd: str = "C:/workspace"
+    name: str = "新会话"
+    name_status: str = "ready"
+    project_root: str = "C:/workspace"
     project_id: str = "workspace-123"
     project_state_dir: str = "C:/home/.siyi/projects/workspace-123"
     session_path: str = "C:/home/.siyi/sessions/sess_test.jsonl"
-    model: str = "gpt-test"
     turn_count: int = 1
     message_count: int = 2
     completed_turns: int = 1
@@ -193,7 +194,7 @@ def test_controller_session_commands() -> None:
 
     assert renderer.calls[0] == ("sessions", ["sess_test", "sess_other"], "sess_test")
     assert renderer.calls[1] == ("note", "started new session: sess_new")
-    assert renderer.calls[2] == ("note", "switched to session: sess_other cwd=C:/workspace")
+    assert renderer.calls[2] == ("note", "switched to session: sess_other project_root=C:/workspace")
 
 
 def test_controller_permission_commands() -> None:
@@ -437,9 +438,7 @@ def test_permission_prompts_are_serialized() -> None:
     request = PermissionRequest(
         tool_name="Write",
         tool_input={"file_path": "a.txt"},
-        reason="tool can modify local state",
-        summary="Write(a.txt)",
-        cwd="C:/workspace",
+        project_root="C:/workspace",
     )
 
     async def run_two_prompts() -> list[bool]:

@@ -188,7 +188,7 @@ class CompactionManager:
         trigger: Literal["manual", "auto"] = "manual",
         custom_instructions: str | None = None,
         transcript_path: str | None = None,
-        cwd: Path | None = None,
+        project_root: Path | None = None,
     ) -> CompactionResult:
         if not self.enabled:
             return CompactionResult(
@@ -245,7 +245,7 @@ class CompactionManager:
         restore_messages = self._build_read_restore_messages(
             source_messages,
             messages_to_keep,
-            cwd=cwd,
+            project_root=project_root,
         )
         messages_after_boundary = [
             summary_message,
@@ -341,12 +341,12 @@ class CompactionManager:
         messages: list[Message],
         preserved_messages: list[Message],
         *,
-        cwd: Path | None,
+        project_root: Path | None,
     ) -> list[Message]:
-        preserved_paths = _collect_read_paths(preserved_messages, cwd=cwd)
+        preserved_paths = _collect_read_paths(preserved_messages, project_root=project_root)
         candidates = [
             path
-            for path in _collect_recent_read_paths(messages, cwd=cwd)
+            for path in _collect_recent_read_paths(messages, project_root=project_root)
             if path not in preserved_paths
         ]
         restored: list[Message] = []
@@ -572,7 +572,7 @@ def _collect_compactable_tool_ids(messages: list[Message]) -> list[str]:
     return ids
 
 
-def _collect_recent_read_paths(messages: list[Message], *, cwd: Path | None) -> list[Path]:
+def _collect_recent_read_paths(messages: list[Message], *, project_root: Path | None) -> list[Path]:
     paths: list[Path] = []
     seen: set[Path] = set()
     for message in reversed(messages):
@@ -581,7 +581,7 @@ def _collect_recent_read_paths(messages: list[Message], *, cwd: Path | None) -> 
         for block in reversed(message.content):
             if not isinstance(block, ToolUseBlock) or block.name != "Read":
                 continue
-            path = _resolve_read_path(block, cwd=cwd)
+            path = _resolve_read_path(block, project_root=project_root)
             if path is None or path in seen:
                 continue
             seen.add(path)
@@ -589,7 +589,7 @@ def _collect_recent_read_paths(messages: list[Message], *, cwd: Path | None) -> 
     return paths
 
 
-def _collect_read_paths(messages: list[Message], *, cwd: Path | None) -> list[Path]:
+def _collect_read_paths(messages: list[Message], *, project_root: Path | None) -> list[Path]:
     paths: list[Path] = []
     seen: set[Path] = set()
     for message in messages:
@@ -598,7 +598,7 @@ def _collect_read_paths(messages: list[Message], *, cwd: Path | None) -> list[Pa
         for block in message.content:
             if not isinstance(block, ToolUseBlock) or block.name != "Read":
                 continue
-            path = _resolve_read_path(block, cwd=cwd)
+            path = _resolve_read_path(block, project_root=project_root)
             if path is None or path in seen:
                 continue
             seen.add(path)
@@ -606,13 +606,13 @@ def _collect_read_paths(messages: list[Message], *, cwd: Path | None) -> list[Pa
     return paths
 
 
-def _resolve_read_path(block: ToolUseBlock, *, cwd: Path | None) -> Path | None:
+def _resolve_read_path(block: ToolUseBlock, *, project_root: Path | None) -> Path | None:
     raw_path = block.input.get("file_path") or block.input.get("path")
     if not raw_path:
         return None
     path = Path(str(raw_path)).expanduser()
-    if not path.is_absolute() and cwd is not None:
-        path = cwd / path
+    if not path.is_absolute() and project_root is not None:
+        path = project_root / path
     return path.resolve()
 
 

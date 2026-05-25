@@ -10,7 +10,7 @@ from config.settings import ToolSettings
 from config.paths import get_global_permissions_path, get_siyi_config_path
 from engine.message_schema import ToolUseBlock
 from engine.query_loop import _tool_batches
-from runtime.permissions import PermissionManager, ensure_permission_files
+from runtime.permissions import PermissionApprovalBroker, PermissionManager, ensure_permission_files
 from tools.base import BaseTool, ToolContext, ToolResult
 from tools.shell_analysis import analyze_bash, analyze_powershell
 from tools.registry import ToolRegistry
@@ -23,11 +23,11 @@ class _DummyWriteTool(BaseTool):
 
     async def run(self, raw_input, context: ToolContext) -> ToolResult:
         del raw_input
-        return ToolResult(success=True, content=context.cwd)
+        return ToolResult(success=True, content=context.project_root)
 
 
 def _context(tmp_path: Path) -> ToolContext:
-    return ToolContext(cwd=str(tmp_path), trace_id="test")
+    return ToolContext(project_root=str(tmp_path), trace_id="test")
 
 
 def test_ensure_permission_files_creates_first_run_defaults() -> None:
@@ -74,7 +74,7 @@ def test_ensure_permission_files_does_not_overwrite_existing_files() -> None:
 
 
 def test_default_shell_permission_uses_exec_rules(tmp_path: Path) -> None:
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
 
     result = manager.check("PowerShell", {"command": "Get-ChildItem"})
 
@@ -83,7 +83,7 @@ def test_default_shell_permission_uses_exec_rules(tmp_path: Path) -> None:
 
 
 def test_default_process_session_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
 
     assert manager.check("exec_command", {"cmd": "Get-ChildItem"}).decision == "allow"
     assert manager.check("write_stdin", {"session_id": "proc_test", "chars": ""}).decision == "allow"
@@ -91,7 +91,7 @@ def test_default_process_session_permissions(tmp_path: Path, monkeypatch: pytest
 
 
 def test_alias_tools_inherit_target_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
     registry = ToolRegistry.default(manager)
     context = _context(tmp_path)
     requester_calls = 0
@@ -117,7 +117,7 @@ def test_alias_tools_inherit_target_permissions(tmp_path: Path, monkeypatch: pyt
 
 
 def test_shell_alias_inherits_target_shell_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
     registry = ToolRegistry.default(manager)
     context = _context(tmp_path)
     shell = registry.find_tool("shell")
@@ -138,7 +138,7 @@ def test_custom_permissions_use_global_siyi_permissions_file(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path, mode="custom")
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path, mode="custom")
     result = manager.check("Write", {"file_path": "a.txt"})
 
     assert result.decision == "deny"
@@ -146,7 +146,7 @@ def test_custom_permissions_use_global_siyi_permissions_file(tmp_path: Path) -> 
 
 
 def test_full_permission_mode_allows_non_shell_but_keeps_shell_rules(tmp_path: Path) -> None:
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path, mode="full")
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path, mode="full")
 
     assert manager.check("Write", {"file_path": "a.txt"}).decision == "allow"
     assert manager.check("PowerShell", {"command": "npx --yes playwright"}).decision == "ask"
@@ -160,7 +160,7 @@ def test_custom_shell_unmatched_uses_configured_fallback(tmp_path: Path) -> None
         json.dumps({"shell_exec_rules": {"unmatched": "deny", "allow_prefix": []}}),
         encoding="utf-8",
     )
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path, mode="custom")
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path, mode="custom")
 
     result = manager.check("PowerShell", {"command": "python -c \"print(1)\""})
 
@@ -185,7 +185,7 @@ def test_shell_exec_rules_precedence_and_legacy_permission_format(tmp_path: Path
         ),
         encoding="utf-8",
     )
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path, mode="custom")
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path, mode="custom")
 
     assert manager.check("Write", {"file_path": "a.txt"}).decision == "allow"
     assert manager.check("Bash", {"command": "rm file.txt"}).decision == "deny"
@@ -200,7 +200,7 @@ def test_cwd_siyi_permission_config_is_ignored(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
     result = manager.check("Bash", {"command": "git status"})
 
     assert result.decision == "allow"
@@ -208,7 +208,7 @@ def test_cwd_siyi_permission_config_is_ignored(tmp_path: Path) -> None:
 
 
 def test_interactive_approval_is_current_call_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
     approvals = 0
 
     async def approve_once(_request) -> bool:
@@ -228,6 +228,59 @@ def test_interactive_approval_is_current_call_only(tmp_path: Path, monkeypatch: 
     assert approvals == 1
 
 
+def test_permission_approval_broker_resolves_pending_request(tmp_path: Path) -> None:
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
+    broker = PermissionApprovalBroker()
+    manager.set_approval_broker(broker)
+    tool = _DummyWriteTool()
+    progress_queue: asyncio.Queue = asyncio.Queue()
+    context = _context(tmp_path).model_copy(
+        update={
+            "session_id": "sess_test",
+            "turn_id": "turn_test",
+            "progress_queue": progress_queue,
+        }
+    )
+
+    async def run() -> PermissionResult:
+        task = asyncio.create_task(manager.authorize(tool, {"file_path": "a.txt"}, context))
+        while not await broker.pending():
+            await asyncio.sleep(0)
+        pending = await broker.pending()
+        assert pending[0].request.project_root == str(tmp_path)
+        assert pending[0].request.turn_id == "turn_test"
+        event = await progress_queue.get()
+        assert event.type == "permission_request"
+        assert event.approval_id == pending[0].approval_id
+        assert event.tool_name == "Write"
+        assert event.tool_input == {"file_path": "a.txt"}
+        assert await broker.resolve(pending[0].approval_id, True)
+        return await task
+
+    result = asyncio.run(run())
+
+    assert result.decision == "allow"
+
+
+def test_permission_approval_broker_denies_pending_request(tmp_path: Path) -> None:
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
+    broker = PermissionApprovalBroker()
+    manager.set_approval_broker(broker)
+    tool = _DummyWriteTool()
+
+    async def run() -> PermissionResult:
+        task = asyncio.create_task(manager.authorize(tool, {"file_path": "a.txt"}, _context(tmp_path)))
+        while not await broker.pending():
+            await asyncio.sleep(0)
+        pending = await broker.pending()
+        assert await broker.resolve(pending[0].approval_id, False)
+        return await task
+
+    result = asyncio.run(run())
+
+    assert result.decision == "deny"
+
+
 def test_sandbox_required_on_native_windows_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     permissions_path = get_global_permissions_path()
     permissions_path.parent.mkdir(parents=True)
@@ -243,7 +296,7 @@ def test_sandbox_required_on_native_windows_is_rejected(tmp_path: Path, monkeypa
         encoding="utf-8",
     )
     monkeypatch.setattr("runtime.permissions.sys.platform", "win32")
-    manager = PermissionManager.from_settings(ToolSettings(), cwd=tmp_path)
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
 
     result = manager.check("PowerShell", {"command": "Get-ChildItem"})
 
@@ -259,7 +312,7 @@ def test_shell_read_only_analysis_is_conservative() -> None:
 
 
 def test_tool_batches_group_consecutive_concurrency_safe_tools(tmp_path: Path) -> None:
-    registry = ToolRegistry.default(PermissionManager.from_settings(ToolSettings(), cwd=tmp_path))
+    registry = ToolRegistry.default(PermissionManager.from_settings(ToolSettings(), project_root=tmp_path))
     context = _context(tmp_path)
 
     batches = _tool_batches(

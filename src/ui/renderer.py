@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
@@ -14,6 +12,7 @@ from engine.events import (
     ErrorEvent,
     FinalAnswerEvent,
     QueryEvent,
+    PermissionRequestEvent,
     StatusEvent,
     ToolOutputDeltaEvent,
     ToolResultEvent,
@@ -41,6 +40,8 @@ class ConsoleRenderer:
             self.render_tool_use(event)
         elif isinstance(event, ToolOutputDeltaEvent):
             self.render_tool_output_delta(event)
+        elif isinstance(event, PermissionRequestEvent):
+            self.render_permission_request(event)
         elif isinstance(event, ToolResultEvent):
             self.render_tool_result(event)
         elif isinstance(event, FinalAnswerEvent):
@@ -48,10 +49,10 @@ class ConsoleRenderer:
         elif isinstance(event, ErrorEvent):
             self.render_error(event.message)
 
-    def render_welcome(self, *, session_id: str, cwd: str, model: str) -> None:
+    def render_welcome(self, *, session_id: str, project_root: str, model: str) -> None:
         self.console.print("[bold]SiYi[/bold] interactive mode")
         self.console.print(
-            f"[dim]session={session_id} model={model} cwd={cwd}[/dim]"
+            f"[dim]session={session_id} model={model} project_root={project_root}[/dim]"
         )
         self.console.print("[dim]Type /help for available commands.[/dim]")
 
@@ -98,6 +99,12 @@ class ConsoleRenderer:
             return
         self.render_status(event.message)
 
+    def render_permission_request(self, event: PermissionRequestEvent) -> None:
+        self.render_assistant_done()
+        self.console.print(
+            f"[yellow]permission requested:[/yellow] {event.tool_name} {event.tool_input}"
+        )
+
     def render_final(self, event: FinalAnswerEvent) -> None:
         if self.debug and event.usage:
             self.console.print(f"[dim]usage={event.usage.model_dump()}[/dim]")
@@ -123,11 +130,12 @@ class ConsoleRenderer:
         table.add_column("Field", style="cyan", no_wrap=True)
         table.add_column("Value")
         table.add_row("session", snapshot.session_id)
-        table.add_row("cwd", snapshot.cwd)
+        table.add_row("name", snapshot.name)
+        table.add_row("name_status", snapshot.name_status)
+        table.add_row("project_root", snapshot.project_root)
         table.add_row("project", snapshot.project_id)
         table.add_row("project_state", snapshot.project_state_dir)
         table.add_row("session_path", snapshot.session_path)
-        table.add_row("model", snapshot.model)
         table.add_row("permission_mode", snapshot.permission_mode)
         table.add_row("turns", str(snapshot.turn_count))
         table.add_row("completed_turns", str(snapshot.completed_turns))
@@ -146,19 +154,18 @@ class ConsoleRenderer:
         table = Table(title="Sessions")
         table.add_column("")
         table.add_column("session")
-        table.add_column("cwd")
-        table.add_column("model")
+        table.add_column("name")
+        table.add_column("status")
         table.add_column("permission")
         table.add_column("messages", justify="right")
         table.add_column("updated")
         for metadata in sessions:
             marker = "*" if metadata.session_id == current_session_id else ""
-            cwd_name = Path(metadata.cwd).name if metadata.cwd else "(legacy)"
             table.add_row(
                 marker,
                 metadata.session_id,
-                cwd_name,
-                metadata.model or "-",
+                metadata.name,
+                metadata.name_status,
                 metadata.permission_mode,
                 str(metadata.message_count),
                 metadata.updated_at,

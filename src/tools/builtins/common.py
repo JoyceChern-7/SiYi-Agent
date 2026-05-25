@@ -64,17 +64,17 @@ def _error(message: str, context: ToolContext, data: JsonObject | None = None) -
         error=message,
     )
 
-def _cwd(context: ToolContext) -> Path:
-    return Path(context.cwd).expanduser().resolve()
+def _project_root(context: ToolContext) -> Path:
+    return Path(context.project_root).expanduser().resolve()
 
 def _resolve_path(context: ToolContext, value: str | None, *, default: str = ".") -> Path:
     raw = Path(value or default).expanduser()
     if not raw.is_absolute():
-        raw = _cwd(context) / raw
+        raw = _project_root(context) / raw
     return raw.resolve()
 
 def _state_dir(context: ToolContext) -> Path:
-    path = get_project_state_dir(_cwd(context))
+    path = get_project_state_dir(_project_root(context))
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -151,7 +151,7 @@ __all__ = [
     "_schema",
     "_ok",
     "_error",
-    "_cwd",
+    "_project_root",
     "_resolve_path",
     "_state_dir",
     "_read_json_file",

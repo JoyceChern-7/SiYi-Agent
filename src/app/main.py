@@ -18,6 +18,7 @@ from runtime.permissions import (
     ensure_permission_files,
     load_global_permission_mode,
 )
+from runtime.project_store import ProjectStore
 from runtime.session_store import JsonlSessionStore
 from runtime.token_budget import TokenBudget
 from runtime.usage_tracker import UsageTracker
@@ -33,6 +34,7 @@ class AppRuntime:
     settings: AppSettings
     tool_registry: ToolRegistry
     llm_adapter: OpenAIChatAdapter
+    project_store: ProjectStore
     session_store: JsonlSessionStore
     permission_manager: PermissionManager
     compaction_manager: CompactionManager
@@ -42,62 +44,52 @@ class AppRuntime:
     renderer: ConsoleRenderer
 
 
-def _resolve_cwd(options: CLIOptions) -> Path:
-    cwd = options.cwd or Path.cwd()
-    if not cwd.exists() or not cwd.is_dir():
-        raise ValueError(f"Working directory does not exist or is not a directory: {cwd}")
-    return cwd.resolve()
-# e.g:  if cwd = Path("../my-project"), then cwd.resolve() = Path("C:/Users/xxxx/Desktop/my-project")
+def _resolve_project_root(options: CLIOptions) -> Path:
+    project_root = options.cwd or Path.cwd()
+    if not project_root.exists() or not project_root.is_dir():
+        raise ValueError(f"Project root does not exist or is not a directory: {project_root}")
+    return project_root.resolve()
 
 def _initialize_process(options: CLIOptions) -> Path:
-    cwd = _resolve_cwd(options)
-    _activate_cwd(cwd)
+    project_root = _resolve_project_root(options)
     os.environ["SIYI_ENTRYPOINT"] = (
         "worker" if options.internal_worker else "cli"
     )
-    return cwd
-
-
-def _activate_cwd(cwd: Path) -> None:
-    os.chdir(cwd)
-    os.environ["SIYI_CWD"] = str(cwd)
+    return project_root
 
 
 def build_runtime(options: CLIOptions) -> AppRuntime:
     started_at = time.perf_counter()
-    cwd = _initialize_process(options)
-    settings = load_settings(options=options, cwd=cwd)
+    project_root = _initialize_process(options)
+    settings = load_settings(options=options, project_root=project_root)
 
     configure_logging(debug=settings.runtime.debug)
     LOGGER.debug(
         "siyi.startup.begin",
         extra={
-            "cwd": str(cwd),
+            "project_root": str(project_root),
             "non_interactive": settings.runtime.non_interactive,
             "resume": settings.runtime.resume,
         },
     )
 
-    session_store = JsonlSessionStore(settings.runtime.session_dir)
+    project_store = ProjectStore()
+    session_store = JsonlSessionStore(settings.runtime.session_dir, project_store=project_store)
     ensure_permission_files()
     permission_mode = load_global_permission_mode()
     session = session_store.open_session(
         requested_session=settings.runtime.resume,
-        cwd=cwd,
-        model=settings.model.model,
+        project_root=project_root,
         permission_mode=permission_mode,
     )
-    session_cwd = Path(session.metadata.cwd).expanduser().resolve()
-    if not session_cwd.exists() or not session_cwd.is_dir():
-        raise ValueError(f"Session working directory does not exist: {session_cwd}")
-    if session_cwd != settings.runtime.cwd:
-        _activate_cwd(session_cwd)
-        settings.runtime.cwd = session_cwd
-        cwd = session_cwd
+    project = session_store.get_project_for_session(session.metadata)
+    if project is None:
+        raise ValueError(f"Session has no project metadata: {session.session_id}")
+    settings.runtime.project_root = Path(project.project_root).expanduser().resolve()
 
     permission_manager = PermissionManager.from_settings(
         settings.tools,
-        cwd=cwd,
+        project_root=settings.runtime.project_root,
         mode=session.metadata.permission_mode,
     )
     tool_registry = ToolRegistry.default(permission_manager=permission_manager)
@@ -125,6 +117,7 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
         settings=settings,
         tool_registry=tool_registry,
         llm_adapter=llm_adapter,
+        project_store=project_store,
         session_store=session_store,
         permission_manager=permission_manager,
         compaction_manager=compaction_manager,

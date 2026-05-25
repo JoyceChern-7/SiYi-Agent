@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import sys
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from config.paths import get_global_permissions_path, get_siyi_config_home, get_siyi_config_path
 from config.settings import ToolSettings
+from runtime.ids import new_id
 from tools.base import ToolContext
 from tools.governance import PermissionDecision, PermissionResult
 from tools.shell_analysis import analyze_bash, analyze_powershell
@@ -69,11 +71,66 @@ class PermissionConfig(BaseModel):
 
 
 class PermissionRequest(BaseModel):
+    approval_id: str | None = None
     tool_name: str
     tool_input: dict[str, Any]
-    reason: str
-    summary: str
-    cwd: str
+    project_root: str
+    session_id: str | None = None
+    turn_id: str | None = None
+
+
+class PendingPermissionApproval(BaseModel):
+    approval_id: str
+    request: PermissionRequest
+
+
+class PermissionApprovalBroker:
+    def __init__(self) -> None:
+        self._pending: dict[str, tuple[PendingPermissionApproval, asyncio.Future[bool]]] = {}
+        self._lock = asyncio.Lock()
+
+    async def request_approval(self, request: PermissionRequest) -> bool:
+        approval_id = request.approval_id or new_id("approval")
+        pending = PendingPermissionApproval(
+            approval_id=approval_id,
+            request=request.model_copy(update={"approval_id": approval_id}),
+        )
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        async with self._lock:
+            self._pending[approval_id] = (pending, future)
+        try:
+            return await future
+        finally:
+            async with self._lock:
+                self._pending.pop(approval_id, None)
+
+    async def resolve(self, approval_id: str, approved: bool) -> bool:
+        async with self._lock:
+            entry = self._pending.get(approval_id)
+        if entry is None:
+            return False
+        _, future = entry
+        if not future.done():
+            future.set_result(approved)
+        return True
+
+    async def pending(self) -> list[PendingPermissionApproval]:
+        async with self._lock:
+            return [entry[0] for entry in self._pending.values()]
+
+    async def cancel_turn(self, turn_id: str) -> None:
+        async with self._lock:
+            entries = [
+                (approval_id, future)
+                for approval_id, (pending, future) in self._pending.items()
+                if pending.request.turn_id == turn_id
+            ]
+        for approval_id, future in entries:
+            if not future.done():
+                future.set_result(False)
+            async with self._lock:
+                self._pending.pop(approval_id, None)
 
 
 def ensure_permission_files() -> None:
@@ -148,16 +205,17 @@ class PermissionManager:
     config: PermissionConfig = field(default_factory=PermissionConfig)
     mode: PermissionMode = "default"
     requester: PermissionRequester | None = None
+    approval_broker: PermissionApprovalBroker | None = None
 
     @classmethod
     def from_settings(
         cls,
         settings: ToolSettings,
         *,
-        cwd: Path | None = None,
+        project_root: Path | None = None,
         mode: str | None = None,
     ) -> "PermissionManager":
-        config = load_permission_config(cwd)
+        config = load_permission_config(project_root)
         if config.source_path is None:
             config.sandbox = SandboxPolicy(
                 enabled=settings.sandbox_enabled,
@@ -170,8 +228,8 @@ class PermissionManager:
             mode=_coerce_permission_mode(mode or load_global_permission_mode()),
         )
 
-    def reload_for_cwd(self, cwd: Path, *, mode: str | None = None) -> None:
-        self.config = load_permission_config(cwd)
+    def reload_for_project_root(self, project_root: Path, *, mode: str | None = None) -> None:
+        self.config = load_permission_config(project_root)
         if self.config.source_path is None:
             self.config.sandbox = SandboxPolicy(
                 enabled=self.settings.sandbox_enabled,
@@ -187,6 +245,9 @@ class PermissionManager:
 
     def set_requester(self, requester: PermissionRequester | None) -> None:
         self.requester = requester
+
+    def set_approval_broker(self, broker: PermissionApprovalBroker | None) -> None:
+        self.approval_broker = broker
 
     def check(
         self,
@@ -224,26 +285,41 @@ class PermissionManager:
         permission_tool_name = str(getattr(tool, "permission_name", getattr(tool, "name", "")))
         display_tool_name = context.tool_name or str(getattr(tool, "name", ""))
         tool_decision = getattr(tool, "check_permissions")(raw_input, context)
-        global_decision = self.check(permission_tool_name, raw_input, {"cwd": context.cwd})
+        global_decision = self.check(permission_tool_name, raw_input, {"project_root": context.project_root})
         decision = _combine_permissions(tool_decision, global_decision)
         if decision.decision != "ask":
             return decision
 
-        if self.requester is None:
+        request = PermissionRequest(
+            approval_id=new_id("approval"),
+            tool_name=display_tool_name,
+            tool_input=raw_input,
+            project_root=context.project_root,
+            session_id=context.session_id,
+            turn_id=context.turn_id,
+        )
+        if self.approval_broker is not None:
+            if context.progress_queue is not None:
+                from engine.events import PermissionRequestEvent
+
+                await context.progress_queue.put(
+                    PermissionRequestEvent(
+                        session_id=context.session_id,
+                        turn_id=context.turn_id,
+                        approval_id=str(request.approval_id),
+                        tool_name=request.tool_name,
+                        tool_input=request.tool_input,
+                        project_root=request.project_root,
+                    )
+                )
+            approved = await self.approval_broker.request_approval(request)
+        elif self.requester is not None:
+            approved = await self.requester(request)
+        else:
             return PermissionResult.deny(
                 reason=f"permission required but no interactive approver is available: {decision.reason}",
                 source=decision.source or "permission",
             )
-
-        approved = await self.requester(
-            PermissionRequest(
-                tool_name=display_tool_name,
-                tool_input=raw_input,
-                reason=decision.reason or "permission required",
-                summary=_tool_input_summary(display_tool_name, raw_input),
-                cwd=context.cwd,
-            )
-        )
         if approved:
             return PermissionResult.allow(reason="approved for this tool call", source="interactive")
         return PermissionResult.deny(reason="user denied this tool call", source="interactive")
@@ -351,8 +427,8 @@ class PermissionManager:
         return tool_name in {"shell", "Bash", "PowerShell", "exec_command"}
 
 
-def load_permission_config(cwd: Path | None) -> PermissionConfig:
-    del cwd
+def load_permission_config(project_root: Path | None) -> PermissionConfig:
+    del project_root
     global_path = get_global_permissions_path()
     if global_path.exists():
         return _read_permission_config(global_path)
@@ -540,13 +616,6 @@ def _permission_payload(tool_name: str, tool_input: dict[str, Any]) -> str:
         if key in tool_input and tool_input[key] is not None:
             return str(tool_input[key])
     return "*"
-
-
-def _tool_input_summary(tool_name: str, tool_input: dict[str, Any]) -> str:
-    payload = _permission_payload(tool_name, tool_input)
-    if len(payload) > 240:
-        payload = f"{payload[:240]}..."
-    return f"{tool_name}({payload})"
 
 
 def _rule_matches(rule: str, tool_name: str, payload: str, candidate: str) -> bool:

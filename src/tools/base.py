@@ -11,7 +11,7 @@ from tools.governance import PermissionResult, ValidationResult
 
 
 class ToolContext(BaseModel):
-    cwd: str
+    project_root: str
     trace_id: str
     session_id: str | None = None
     turn_id: str | None = None

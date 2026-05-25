@@ -64,11 +64,11 @@ class AgentTool(BaseTool):
 def _siyi_command(prompt: str, context: ToolContext) -> list[str]:
     exe = shutil.which("siyi")
     if exe:
-        return [exe, "--cwd", context.cwd, "--internal-worker-prompt", prompt]
+        return [exe, "--cwd", context.project_root, "--internal-worker-prompt", prompt]
     env_pythonpath = os.environ.get("PYTHONPATH")
     src_path = str(Path(__file__).resolve().parents[1])
     os.environ["PYTHONPATH"] = f"{src_path}{os.pathsep}{env_pythonpath}" if env_pythonpath else src_path
-    return [sys.executable, "-m", "app.cli", "--cwd", context.cwd, "--internal-worker-prompt", prompt]
+    return [sys.executable, "-m", "app.cli", "--cwd", context.project_root, "--internal-worker-prompt", prompt]
 
 class SendMessageTool(BaseTool):
     name = "SendMessage"

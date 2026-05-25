@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -16,7 +15,9 @@ from engine.message_schema import (
     tool_result_message,
     user_message,
 )
+from engine.session_title import normalize_session_title
 from llm.base import LLMAdapter, LLMAssistantDone, LLMTextDelta, LLMToolUse
+from runtime.session_runtime import SessionBusyError, SessionRuntime
 from runtime.token_budget import AUTO_COMPACT_THRESHOLD_TOKENS
 from runtime.compaction import CompactionManager, TIME_BASED_MC_CLEARED_MESSAGE
 from runtime.usage_tracker import Usage
@@ -60,6 +61,35 @@ class RaisingLLMAdapter(LLMAdapter):
         yield  # pragma: no cover
 
 
+class BlockingLLMAdapter(LLMAdapter):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream_chat(
+        self,
+        messages,
+        system_prompt: str,
+        tools,
+        temperature: float,
+    ) -> AsyncIterator[LLMTextDelta | LLMAssistantDone]:
+        del messages, system_prompt, tools, temperature
+        self.started.set()
+        await self.release.wait()
+        yield LLMTextDelta(delta="done")
+        yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
+
+
+class FakeTitleAgent:
+    def __init__(self, title: str | None = None) -> None:
+        self.title = title
+
+    async def generate(self, first_user_input: str) -> str:
+        if self.title is None:
+            raise RuntimeError("title failed")
+        return self.title
+
+
 class PromptTooLongThenSummaryLLM(LLMAdapter):
     def __init__(self) -> None:
         self.calls = 0
@@ -81,6 +111,12 @@ class PromptTooLongThenSummaryLLM(LLMAdapter):
 
 async def _collect_events(engine, prompt: str):
     return [event async for event in engine.submit_user_input(prompt)]
+
+
+async def _collect_events_and_title(engine, prompt: str):
+    events = [event async for event in engine.submit_user_input(prompt)]
+    await engine.wait_for_title_task()
+    return events
 
 
 def test_query_engine_accumulates_multi_turn_history_and_resume(tmp_path: Path) -> None:
@@ -119,18 +155,74 @@ def test_query_engine_accumulates_multi_turn_history_and_resume(tmp_path: Path) 
     assert len(resumed.query_engine.get_messages()) == 4
 
 
-def test_global_session_index_and_cross_cwd_switch(tmp_path: Path) -> None:
-    first_cwd = tmp_path / "first"
-    second_cwd = tmp_path / "second"
-    first_cwd.mkdir()
-    second_cwd.mkdir()
+def test_session_title_agent_updates_pending_session_name(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    runtime.query_engine.llm = FakeLLMAdapter(["answer"])
+    runtime.query_engine.title_agent = FakeTitleAgent("实现 FastAPI")
 
-    first = build_runtime(parse_args(["--cwd", str(first_cwd)]))
+    asyncio.run(_collect_events_and_title(runtime.query_engine, "帮我实现 FastAPI"))
+
+    metadata = runtime.query_engine.session.metadata
+    assert metadata.name == "实现 FastAPI"
+    assert metadata.name_status == "ready"
+
+
+def test_session_title_falls_back_to_truncated_prompt(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    runtime.query_engine.llm = FakeLLMAdapter(["answer"])
+    runtime.query_engine.title_agent = FakeTitleAgent(None)
+
+    asyncio.run(_collect_events_and_title(runtime.query_engine, "请分析这个项目并提出迁移建议"))
+
+    metadata = runtime.query_engine.session.metadata
+    assert metadata.name == "请分析这个项目并提出"
+    assert metadata.name_status == "ready"
+
+
+def test_session_title_limits_english_words() -> None:
+    assert normalize_session_title(
+        "one two three four five six seven eight nine ten eleven twelve"
+    ) == "one two three four five six seven eight nine ten"
+
+
+def test_session_runtime_rejects_same_session_concurrent_prompt(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    llm = BlockingLLMAdapter()
+    runtime.query_engine.llm = llm
+    runtime.query_engine.session.metadata.name_status = "ready"
+    session_runtime = SessionRuntime(runtime.query_engine)
+
+    async def run() -> SessionBusyError:
+        first_task = asyncio.create_task(_collect_events(session_runtime, "first"))
+        await llm.started.wait()
+        try:
+            await _collect_events(session_runtime, "second")
+        except SessionBusyError as exc:
+            error = exc
+        else:
+            raise AssertionError("expected SessionBusyError")
+        finally:
+            llm.release.set()
+            await first_task
+        return error
+
+    error = asyncio.run(run())
+
+    assert error.session_id == runtime.query_engine.session.session_id
+
+
+def test_global_session_index_and_cross_project_switch(tmp_path: Path) -> None:
+    first_project_root = tmp_path / "first"
+    second_project_root = tmp_path / "second"
+    first_project_root.mkdir()
+    second_project_root.mkdir()
+
+    first = build_runtime(parse_args(["--cwd", str(first_project_root)]))
     first.query_engine.llm = FakeLLMAdapter(["first answer"])
     asyncio.run(_collect_events(first.query_engine, "first question"))
     first_session_id = first.query_engine.session.session_id
 
-    second = build_runtime(parse_args(["--cwd", str(second_cwd)]))
+    second = build_runtime(parse_args(["--cwd", str(second_project_root)]))
     second_session_id = second.query_engine.session.session_id
 
     sessions = second.query_engine.list_sessions()
@@ -140,8 +232,7 @@ def test_global_session_index_and_cross_cwd_switch(tmp_path: Path) -> None:
     snapshot = asyncio.run(second.query_engine.switch_session(first_session_id))
 
     assert snapshot.session_id == first_session_id
-    assert Path(snapshot.cwd) == first_cwd.resolve()
-    assert Path(os.environ["SIYI_CWD"]) == first_cwd.resolve()
+    assert Path(snapshot.project_root) == first_project_root.resolve()
     assert second.query_engine.get_messages()[0].to_plain_text() == "first question"
     assert second.query_engine.turn_counter == 1
 
@@ -172,28 +263,28 @@ def test_session_permission_mode_inherits_global_default_and_switches(tmp_path: 
     assert second.query_engine.permission_manager.mode == "custom"
 
 
-def test_session_switch_rejects_missing_cwd_without_changing_current_session(tmp_path: Path) -> None:
-    first_cwd = tmp_path / "first"
-    second_cwd = tmp_path / "second"
-    first_cwd.mkdir()
-    second_cwd.mkdir()
+def test_session_switch_rejects_missing_project_root_without_changing_current_session(tmp_path: Path) -> None:
+    first_project_root = tmp_path / "first"
+    second_project_root = tmp_path / "second"
+    first_project_root.mkdir()
+    second_project_root.mkdir()
 
-    first = build_runtime(parse_args(["--cwd", str(first_cwd)]))
+    first = build_runtime(parse_args(["--cwd", str(first_project_root)]))
     missing_session_id = first.query_engine.session.session_id
-    second = build_runtime(parse_args(["--cwd", str(second_cwd)]))
+    second = build_runtime(parse_args(["--cwd", str(second_project_root)]))
     current_session_id = second.query_engine.session.session_id
-    current_cwd = second.query_engine.settings.runtime.cwd
-    first_cwd.rmdir()
+    current_project_root = second.query_engine.settings.runtime.project_root
+    first_project_root.rmdir()
 
     try:
         asyncio.run(second.query_engine.switch_session(missing_session_id))
     except ValueError as exc:
         assert "does not exist" in str(exc)
     else:
-        raise AssertionError("switch should fail for a missing cwd")
+        raise AssertionError("switch should fail for a missing project root")
 
     assert second.query_engine.session.session_id == current_session_id
-    assert second.query_engine.settings.runtime.cwd == current_cwd
+    assert second.query_engine.settings.runtime.project_root == current_project_root
 
 
 def test_session_index_can_be_rebuilt_from_session_meta(tmp_path: Path) -> None:

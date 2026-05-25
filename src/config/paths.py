@@ -29,15 +29,15 @@ def get_projects_dir() -> Path:
     return (get_siyi_home() / "projects").resolve()
 
 
-def get_project_id(cwd: Path | str) -> str:
-    resolved = Path(cwd).expanduser().resolve()
+def get_project_id(project_root: Path | str) -> str:
+    resolved = Path(project_root).expanduser().resolve()
     safe_name = _safe_project_name(resolved.name or "workspace")
     digest = sha256(os.path.normcase(str(resolved)).encode("utf-8")).hexdigest()[:10]
     return f"{safe_name}-{digest}"
 
 
-def get_project_state_dir(cwd: Path | str) -> Path:
-    return (get_projects_dir() / get_project_id(cwd)).resolve()
+def get_project_state_dir(project_root: Path | str) -> Path:
+    return (get_projects_dir() / get_project_id(project_root)).resolve()
 
 
 def get_session_dir() -> Path:
