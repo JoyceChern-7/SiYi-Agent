@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from config.paths import get_global_permissions_path, get_siyi_config_home, get_siyi_config_path
+from config.paths import get_global_permissions_path, get_siyi_config_path
 from config.settings import ToolSettings
 from runtime.ids import new_id
 from tools.base import ToolContext
@@ -84,6 +84,10 @@ class PendingPermissionApproval(BaseModel):
     request: PermissionRequest
 
 
+class PermissionApprovalCanceled(RuntimeError):
+    pass
+
+
 class PermissionApprovalBroker:
     def __init__(self) -> None:
         self._pending: dict[str, tuple[PendingPermissionApproval, asyncio.Future[bool]]] = {}
@@ -128,7 +132,7 @@ class PermissionApprovalBroker:
             ]
         for approval_id, future in entries:
             if not future.done():
-                future.set_result(False)
+                future.set_exception(PermissionApprovalCanceled("approval canceled"))
             async with self._lock:
                 self._pending.pop(approval_id, None)
 
@@ -138,7 +142,11 @@ def ensure_permission_files() -> None:
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
-            json.dumps({"permission_mode": "default"}, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(
+                {"permission_mode": "default"},
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
             encoding="utf-8",
         )
 
@@ -258,8 +266,6 @@ class PermissionManager:
         del context
         if self._is_shell_tool(tool_name, tool_input) and not self.settings.shell_enabled:
             return PermissionResult.deny(reason="shell tool is disabled", source="settings")
-        if tool_name == "Read" and not self.settings.read_file_enabled:
-            return PermissionResult.deny(reason="file reads are disabled", source="settings")
         if tool_name in {"WebSearch", "WebFetch", "web_search", "web_fetch"} and not self.settings.web_search_enabled:
             return PermissionResult.deny(reason="web tools are disabled", source="settings")
 
@@ -300,7 +306,7 @@ class PermissionManager:
         )
         if self.approval_broker is not None:
             if context.progress_queue is not None:
-                from engine.events import PermissionRequestEvent
+                from engine.events import ApprovalResolvedEvent, PermissionRequestEvent
 
                 await context.progress_queue.put(
                     PermissionRequestEvent(
@@ -312,7 +318,22 @@ class PermissionManager:
                         project_root=request.project_root,
                     )
                 )
-            approved = await self.approval_broker.request_approval(request)
+            canceled = False
+            try:
+                approved = await self.approval_broker.request_approval(request)
+            except PermissionApprovalCanceled:
+                approved = False
+                canceled = True
+            if context.progress_queue is not None:
+                await context.progress_queue.put(
+                    ApprovalResolvedEvent(
+                        session_id=context.session_id,
+                        turn_id=context.turn_id,
+                        approval_id=str(request.approval_id),
+                        approved=approved,
+                        tool_name=request.tool_name,
+                    )
+                )
         elif self.requester is not None:
             approved = await self.requester(request)
         else:
@@ -322,6 +343,8 @@ class PermissionManager:
             )
         if approved:
             return PermissionResult.allow(reason="approved for this tool call", source="interactive")
+        if canceled:
+            return PermissionResult.deny(reason="approval canceled", source="approval_canceled")
         return PermissionResult.deny(reason="user denied this tool call", source="interactive")
 
     def _check_rule_lists(
@@ -433,10 +456,6 @@ def load_permission_config(project_root: Path | None) -> PermissionConfig:
     if global_path.exists():
         return _read_permission_config(global_path)
 
-    legacy_path = get_siyi_config_home() / "permissions.json"
-    if legacy_path.exists():
-        return _read_permission_config(legacy_path)
-
     return PermissionConfig()
 
 
@@ -467,9 +486,6 @@ def _read_permission_config(path: Path) -> PermissionConfig:
 def _default_permission_rules() -> PermissionRules:
     return PermissionRules(
         allow=[
-            "Read(*)",
-            "Glob(*)",
-            "Grep(*)",
             "WebSearch(*)",
             "WebFetch(*)",
             "ToolSearch(*)",
@@ -491,9 +507,6 @@ def _default_permission_rules() -> PermissionRules:
             "Bash(*)",
             "PowerShell(*)",
             "exec_command(*)",
-            "Write(*)",
-            "Edit(*)",
-            "NotebookEdit(*)",
             "Agent(*)",
             "SendMessage(*)",
             "TeamCreate(*)",
@@ -630,9 +643,6 @@ def _rule_matches(rule: str, tool_name: str, payload: str, candidate: str) -> bo
 
 def _is_default_read_tool(tool_name: str, tool_input: dict[str, Any]) -> bool:
     if tool_name in {
-        "Read",
-        "Glob",
-        "Grep",
         "WebSearch",
         "WebFetch",
         "ToolSearch",

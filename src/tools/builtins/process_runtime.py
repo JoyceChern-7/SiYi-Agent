@@ -213,6 +213,9 @@ class ProcessSession:
     command: str
     args: list[str]
     cwd: str
+    session_id: str | None
+    turn_id: str | None
+    project_root: str
     process: asyncio.subprocess.Process
     tty: bool = True
     stdin_authorized: bool = True
@@ -270,6 +273,9 @@ class ProcessSessionManager:
             command=command,
             args=args,
             cwd=str(cwd),
+            session_id=context.session_id,
+            turn_id=context.turn_id,
+            project_root=context.project_root,
             process=process,
             tty=tty,
             stdin_authorized=tty,
@@ -324,6 +330,8 @@ class ProcessSessionManager:
         session = self.get(process_id)
         if session is None:
             return None, "", ""
+        if not _context_owns_process(session, context):
+            return None, "", ""
         await self._wait_for_new_output(session, context, wait_ms)
         return session, session.stdout.consume(), session.stderr.consume()
 
@@ -340,6 +348,8 @@ class ProcessSessionManager:
         session = self.get(process_id)
         if session is None:
             return None, "", "", "process not found"
+        if not _context_owns_process(session, context):
+            return session, "", "", "process belongs to another session"
         error: str | None = None
         if chars:
             if not session.tty or not session.stdin_authorized:
@@ -377,6 +387,8 @@ class ProcessSessionManager:
         session = self.get(process_id)
         if session is None:
             return None, "", ""
+        if not _context_owns_process(session, context):
+            return None, "", ""
         await self._activate(session, context)
         try:
             if session.is_running():
@@ -396,6 +408,27 @@ class ProcessSessionManager:
         if session.status == "stopping":
             session.status = "stopped"
         return session, session.stdout.consume(), session.stderr.consume()
+
+    async def stop_for_turn(self, turn_id: str) -> None:
+        await self._stop_matching(lambda session: session.turn_id == turn_id)
+
+    async def stop_for_session(self, session_id: str) -> None:
+        await self._stop_matching(lambda session: session.session_id == session_id)
+
+    async def _stop_matching(self, predicate: Callable[[ProcessSession], bool]) -> None:
+        sessions = [session for session in self.sessions.values() if predicate(session)]
+        for session in sessions:
+            if session.is_running():
+                session.status = "stopping"
+                await _terminate_process_tree(session.process)
+        for session in sessions:
+            if session.is_running():
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(session.exit_event.wait(), timeout=2)
+            await _drain_reader_tasks(session.reader_tasks)
+            if session.status == "stopping":
+                session.status = "stopped"
+            self.sessions.pop(session.process_id, None)
 
     async def _read_stream(
         self,
@@ -556,6 +589,13 @@ class ProcessSessionManager:
 
 
 PROCESSES = ProcessSessionManager()
+
+def _context_owns_process(session: ProcessSession, context: ToolContext) -> bool:
+    if session.session_id is None:
+        return True
+    if context.session_id is None:
+        return False
+    return session.session_id == context.session_id
 
 def _format_process_result(
     session: ProcessSession,

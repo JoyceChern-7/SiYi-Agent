@@ -37,7 +37,6 @@ class ModelSettings(BaseModel):
 
 class ToolSettings(BaseModel):
     web_search_enabled: bool = True
-    read_file_enabled: bool = True
     shell_enabled: bool = True
     shell_requires_approval: bool = True
     sandbox_enabled: bool = False

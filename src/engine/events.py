@@ -16,24 +16,57 @@ class QueryEvent(BaseModel):
     turn_id: str | None = None
 
 
+AgentErrorCategory = Literal[
+    "validation",
+    "concurrency",
+    "provider",
+    "permission",
+    "tool",
+    "process",
+    "runtime",
+    "config",
+]
+
+
+class AgentError(QueryEvent):
+    type: Literal["agent_error"] = "agent_error"
+    code: str
+    category: AgentErrorCategory
+    message: str
+    retryable: bool = False
+    action: str | None = None
+    tool_name: str | None = None
+    tool_use_id: str | None = None
+    process_id: str | None = None
+    approval_id: str | None = None
+    trace_id: str = Field(default_factory=lambda: new_id("trace"))
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class AssistantDeltaEvent(QueryEvent):
     type: Literal["assistant_delta"] = "assistant_delta"
     delta: str
 
 
-class AssistantDoneEvent(QueryEvent):
-    type: Literal["assistant_done"] = "assistant_done"
+class TurnStartedEvent(QueryEvent):
+    type: Literal["turn_started"] = "turn_started"
+    turn_index: int
+
+
+class AssistantMessageEvent(QueryEvent):
+    type: Literal["assistant_message"] = "assistant_message"
     message: Message
 
 
-class ToolUseEvent(QueryEvent):
-    type: Literal["tool_use"] = "tool_use"
+class ToolCallEvent(QueryEvent):
+    type: Literal["tool_call"] = "tool_call"
     block: ToolUseBlock
 
 
 class ToolResultEvent(QueryEvent):
     type: Literal["tool_result"] = "tool_result"
     block: ToolResultBlock
+    error: AgentError | None = None
 
 
 class ToolOutputDeltaEvent(QueryEvent):
@@ -54,22 +87,25 @@ class PermissionRequestEvent(QueryEvent):
     project_root: str
 
 
-class StatusEvent(QueryEvent):
-    type: Literal["status"] = "status"
-    message: str
-    code: str | None = None
-    details: dict[str, Any] = Field(default_factory=dict)
+class ApprovalResolvedEvent(QueryEvent):
+    type: Literal["approval_resolved"] = "approval_resolved"
+    approval_id: str
+    approved: bool
+    tool_name: str
 
 
-class FinalAnswerEvent(QueryEvent):
-    type: Literal["final_answer"] = "final_answer"
-    message: Message
+class TurnCompletedEvent(QueryEvent):
+    type: Literal["turn_completed"] = "turn_completed"
+    status: Literal["completed", "failed", "interrupted"]
     usage: Usage | None = None
     estimated_cost: float | None = None
+    stop_reason: str | None = None
+    error: AgentError | None = None
 
 
-class ErrorEvent(QueryEvent):
-    type: Literal["error"] = "error"
-    message: str
-    retryable: bool = False
-    code: str | None = None
+class SessionUpdatedEvent(QueryEvent):
+    type: Literal["session_updated"] = "session_updated"
+    name: str | None = None
+    name_status: str | None = None
+    permission_mode: str | None = None
+

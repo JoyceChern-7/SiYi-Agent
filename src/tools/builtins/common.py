@@ -68,10 +68,10 @@ def _project_root(context: ToolContext) -> Path:
     return Path(context.project_root).expanduser().resolve()
 
 def _resolve_path(context: ToolContext, value: str | None, *, default: str = ".") -> Path:
-    raw = Path(value or default).expanduser()
-    if not raw.is_absolute():
-        raw = _project_root(context) / raw
-    return raw.resolve()
+    path = Path(value or default).expanduser()
+    if not path.is_absolute():
+        path = _project_root(context) / path
+    return path.resolve()
 
 def _state_dir(context: ToolContext) -> Path:
     path = get_project_state_dir(_project_root(context))

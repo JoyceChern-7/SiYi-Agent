@@ -14,6 +14,7 @@ TurnStage = Literal[
     "running",
     "completed",
     "failed",
+    "interrupted",
 ]
 
 
@@ -67,6 +68,12 @@ class QueryTurnState:
         self.stage = "failed"
         self.error = error
         self.retryable_error = retryable
+        self.finished_at = datetime.now(timezone.utc)
+
+    def mark_interrupted(self, error: str = "interrupted") -> None:
+        self.stage = "interrupted"
+        self.error = error
+        self.retryable_error = True
         self.finished_at = datetime.now(timezone.utc)
 
     def mark_completed(self, stop_reason: str | None = None) -> None:

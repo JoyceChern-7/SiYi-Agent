@@ -9,16 +9,21 @@ from pathlib import Path
 from config.paths import get_global_permissions_path, get_siyi_config_path
 from config.settings import AppSettings
 from engine.events import (
-    ErrorEvent,
-    FinalAnswerEvent,
+    AgentError,
     QueryEvent,
-    StatusEvent,
+    SessionUpdatedEvent,
+    ToolResultEvent,
+    TurnCompletedEvent,
+    TurnStartedEvent,
 )
 from engine.message_schema import (
     Message,
     TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
     get_messages_after_compact_boundary,
     normalize_messages_for_api,
+    tool_result_message,
     user_message,
 )
 from engine.query_loop import DefaultQueryLoop, QueryLoop
@@ -31,13 +36,57 @@ from runtime.permissions import (
     load_global_permission_mode,
     save_global_permission_mode,
 )
-from runtime.session_store import JsonlSessionStore, SessionHandle, SessionMetadata
+from runtime.read_model import HistoryService, SessionSummary, TurnView
+from runtime.ids import new_id
+from runtime.session_store import JsonlSessionStore, SessionHandle
 from runtime.token_budget import BudgetSnapshot, TokenBudget
+from runtime.turn_runtime import TurnInterruptedError
 from runtime.usage_tracker import UsageTracker
 from tools.base import ToolContext
 from tools.registry import ToolRegistry
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _usage_has_tokens(usage: object) -> bool:
+    return bool(
+        getattr(usage, "input_tokens", 0)
+        or getattr(usage, "output_tokens", 0)
+        or getattr(usage, "cached_tokens", 0)
+    )
+
+
+def _agent_error_from_exception(
+    exc: Exception,
+    *,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+) -> AgentError:
+    message = str(exc) or type(exc).__name__
+    lowered = message.lower()
+    code = "runtime_error"
+    category = "runtime"
+    retryable = False
+    action = None
+    if "api key" in lowered or "authentication" in lowered or "unauthorized" in lowered or "401" in lowered:
+        code = "provider_auth_invalid"
+        category = "provider"
+        action = "open_provider_settings"
+    elif "rate limit" in lowered or "429" in lowered:
+        code = "provider_rate_limited"
+        category = "provider"
+        retryable = True
+        action = "retry_after"
+    return AgentError(
+        session_id=session_id,
+        turn_id=turn_id,
+        code=code,
+        category=category,  # type: ignore[arg-type]
+        message=message,
+        retryable=retryable,
+        action=action,
+        details={"exception_type": type(exc).__name__},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,7 +101,7 @@ class SessionSnapshot:
     turn_count: int
     message_count: int
     completed_turns: int
-    last_error: str | None
+    last_error: AgentError | None
     total_usage: dict[str, int]
     estimated_total_cost: float
     permission_mode: str
@@ -93,25 +142,35 @@ class QueryEngine:
         self.token_budget = token_budget
         self.usage_tracker = usage_tracker
         self.query_loop = query_loop or DefaultQueryLoop()
+        self.history_service = HistoryService(session_store)
         self.title_agent = SessionTitleAgent(llm)
         self._title_task: asyncio.Task[None] | None = None
         self.mutable_messages: list[Message] = list(session.messages)
-        self.last_error: str | None = None
+        self.last_error: AgentError | None = None
         self.current_turn: QueryTurnState | None = None
+        self._active_cancel_event: asyncio.Event | None = None
         self.turn_counter = self._derive_turn_counter()
         self.auto_compact_failures = 0
         self.usage_tracker.rebuild_from_messages(self.mutable_messages)
 
-    async def submit_user_input(self, text: str) -> AsyncIterator[QueryEvent]:
+    async def submit_user_input(
+        self,
+        text: str,
+        *,
+        turn_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AsyncIterator[QueryEvent]:
         prompt = text.strip() 
         if not prompt:
-            self.last_error = "empty_prompt"
-            error = ErrorEvent(
+            error = AgentError(
                 session_id=self.session.session_id,
+                turn_id=turn_id,
+                code="empty_prompt",
+                category="validation",
                 message="Prompt is empty.",
                 retryable=False,
-                code="empty_prompt",
             )
+            self.last_error = error
             self.session_store.append_event(self.session, error)
             yield error
             return
@@ -120,35 +179,22 @@ class QueryEngine:
         if self.session.metadata.name_status == "pending" and self.turn_counter == 0:
             self._start_title_task(prompt)
         user_msg = self._build_user_message(prompt)
-        turn = self._create_turn_state(prompt, user_msg)
+        turn = self._create_turn_state(prompt, user_msg, turn_id=turn_id)
         self.current_turn = turn
+        self._active_cancel_event = cancel_event
 
         self._append_message(user_msg)
-        yield self._status(
-            turn,
-            f"session={self.session.session_id}",
-            code="session_ready",
-            persisted_messages=len(self.mutable_messages),
-        )
-        yield self._status(
-            turn,
-            f"turn={turn.turn_index}",
-            code="turn_started",
+        turn_started = TurnStartedEvent(
+            session_id=turn.session_id,
             turn_id=turn.turn_id,
+            turn_index=turn.turn_index,
         )
-
-        budget = await self._prepare_turn(turn)
-        yield self._status(
-            turn,
-            f"estimated_tokens={budget.estimated_tokens}",
-            code="budget_estimate",
-            estimated_tokens=budget.estimated_tokens,
-            autocompact_threshold=budget.autocompact_threshold,
-            should_autocompact=budget.should_autocompact,
-        )
+        self.session_store.append_event(self.session, turn_started)
+        yield turn_started
 
         persisted_generated_count = 0
         try:
+            await self._prepare_turn(turn)
             async for event in self.query_loop.run(
                 turn,
                 llm=self.llm,
@@ -163,6 +209,7 @@ class QueryEngine:
                     turn_id=turn.turn_id,
                     max_result_chars=self.settings.tools.max_tool_result_chars,
                 ),
+                cancel_event=cancel_event,
             ):
                 persisted_generated_count = self._drain_generated_messages(
                     turn,
@@ -174,23 +221,42 @@ class QueryEngine:
                 self._persist_event(emitted)
                 # 最后将事件 yield 出去，供 UI 层消费并渲染
                 yield emitted 
+        except TurnInterruptedError:
+            await self._cancel_turn_side_effects(turn.turn_id)
+            synthetic_events = self._complete_pending_tool_results(turn)
+            persisted_generated_count = self._drain_generated_messages(
+                turn,
+                persisted_generated_count,
+            )
+            self._hide_interrupted_turn_from_model(turn)
+            turn.mark_interrupted()
+            completed = self._build_turn_completed_event(turn, status="interrupted")
+            self.session_store.append_event(self.session, completed)
+            for event in synthetic_events:
+                yield event
+            yield completed
+            return
         except Exception as exc:  # noqa: BLE001
             if self.settings.runtime.debug:
                 LOGGER.exception("query_engine.turn_failed")
             else:
                 LOGGER.debug("query_engine.turn_failed", exc_info=exc)
-            turn.mark_failed(type(exc).__name__, retryable=False)
-            self.last_error = turn.error
-            error = ErrorEvent(
-                session_id=turn.session_id,
-                turn_id=turn.turn_id,
-                message=str(exc),
-                retryable=False,
-                code=type(exc).__name__,
+            error = _agent_error_from_exception(exc, session_id=turn.session_id, turn_id=turn.turn_id)
+            turn.mark_failed(error.code, retryable=error.retryable)
+            self.last_error = error
+            completed = self._build_turn_completed_event(
+                turn,
+                status="failed",
+                error=error,
             )
-            self.session_store.append_event(self.session, error)
-            yield error
+            self.session_store.append_event(self.session, completed)
+            yield completed
             return
+        finally:
+            if self.current_turn is turn:
+                self.current_turn = None
+            if self._active_cancel_event is cancel_event:
+                self._active_cancel_event = None
 
         persisted_generated_count = self._drain_generated_messages(
             turn,
@@ -198,31 +264,33 @@ class QueryEngine:
         )
         turn.mark_completed(turn.stop_reason)
 
-        usage_snapshot = self.usage_tracker.record_turn(turn.turn_id, turn.usage_delta)
-        final_message = turn.final_message or self._build_fallback_final_message()
-        final_event = FinalAnswerEvent(
-            session_id=turn.session_id,
-            turn_id=turn.turn_id,
-            message=final_message,
-            usage=self.usage_tracker.get_total_usage(),
-            estimated_cost=usage_snapshot.estimated_cost,
-        )
-        self.session_store.append_event(self.session, final_event)
-        yield final_event
+        completed = self._build_turn_completed_event(turn, status="completed")
+        self.session_store.append_event(self.session, completed)
+        yield completed
 
     def _build_user_message(self, text: str) -> Message:
         return user_message(text)
 
-    def _create_turn_state(self, prompt: str, user_msg: Message) -> QueryTurnState:
+    def _create_turn_state(
+        self,
+        prompt: str,
+        user_msg: Message,
+        *,
+        turn_id: str | None = None,
+    ) -> QueryTurnState:
         self.turn_counter += 1
         prior_messages = list(self.mutable_messages)
-        return QueryTurnState(
+        turn = QueryTurnState(
             session_id=self.session.session_id,
             turn_index=self.turn_counter,
             user_message=user_msg,
             prompt_text=prompt,
+            turn_id=turn_id or new_id("turn"),
             messages=[*prior_messages, user_msg],
         )
+        user_msg.metadata["turn_id"] = turn.turn_id
+        user_msg.metadata["turn_index"] = turn.turn_index
+        return turn
 
     async def _prepare_turn(self, turn: QueryTurnState) -> BudgetSnapshot:
         turn.stage = "preflight"
@@ -265,7 +333,6 @@ class QueryEngine:
         return result
 
     async def new_session(self) -> SessionSnapshot:
-        await self._clear_process_sessions()
         project = self.session_store.project_store.ensure_project(self.settings.runtime.project_root)
         session = self.session_store.create_session(
             project=project,
@@ -286,14 +353,35 @@ class QueryEngine:
             raise ValueError(f"Session project root does not exist: {project_root}")
 
         session = self.session_store.switch_session(session_id)
-        await self._clear_process_sessions()
         self.settings.runtime.project_root = project_root
         self.permission_manager.reload_for_project_root(project_root, mode=metadata.permission_mode)
         self._activate_session(session)
         return self.get_session_snapshot()
 
-    def list_sessions(self) -> list[SessionMetadata]:
-        return self.session_store.list_sessions()
+    def list_sessions(self) -> list[SessionSummary]:
+        return self.history_service.list_session_summaries(
+            active_session_id=self.session.session_id,
+            active_turn_id=self.current_turn.turn_id if self.current_turn is not None else None,
+            last_error=self.last_error,
+            usage=self.usage_tracker.get_total_usage(),
+        )
+
+    def get_session_turns(
+        self,
+        session_id: str | None = None,
+        *,
+        cursor: str | None = None,
+        limit: int | None = None,
+        items_view: str = "full",
+    ) -> tuple[list[TurnView], str | None]:
+        target_session_id = session_id or self.session.session_id
+        view = "summary" if items_view == "summary" else "full"
+        return self.history_service.get_session_turns(
+            target_session_id,
+            cursor=cursor,
+            limit=limit,
+            items_view=view,
+        )
 
     def get_permission_snapshot(self) -> PermissionSnapshot:
         return PermissionSnapshot(
@@ -307,6 +395,7 @@ class QueryEngine:
         permission_mode = self.permission_manager.set_mode(mode)
         self.session.metadata.permission_mode = permission_mode
         self.session_store.update_metadata(self.session)
+        self._append_session_updated_event(permission_mode=permission_mode)
         return self.get_permission_snapshot()
 
     def set_global_permission_mode(self, mode: str) -> PermissionSnapshot:
@@ -401,31 +490,136 @@ class QueryEngine:
             return
         self.session_store.append_event(self.session, event)
 
-    def _status(
+    def _build_turn_completed_event(
         self,
         turn: QueryTurnState,
-        message: str,
         *,
-        code: str,
-        **details: object,
-    ) -> StatusEvent:
-        event = StatusEvent(
+        status: str,
+        error: AgentError | None = None,
+    ) -> TurnCompletedEvent:
+        usage_snapshot = None
+        if status == "completed" or _usage_has_tokens(turn.usage_delta):
+            usage_snapshot = self.usage_tracker.record_turn(turn.turn_id, turn.usage_delta)
+        if error is None and status == "interrupted":
+            error = AgentError(
+                session_id=turn.session_id,
+                turn_id=turn.turn_id,
+                code="turn_interrupted",
+                category="runtime",
+                message="turn interrupted",
+                retryable=False,
+            )
+        elif error is None and status == "failed":
+            error = AgentError(
+                session_id=turn.session_id,
+                turn_id=turn.turn_id,
+                code=turn.error or "runtime_error",
+                category="runtime",
+                message=turn.error or "turn failed",
+                retryable=turn.retryable_error,
+            )
+        if error is not None:
+            self.last_error = error
+        return TurnCompletedEvent(
             session_id=turn.session_id,
             turn_id=turn.turn_id,
-            message=message,
-            code=code,
-            details={key: value for key, value in details.items()},
+            status=status,  # type: ignore[arg-type]
+            usage=self.usage_tracker.get_total_usage(),
+            estimated_cost=usage_snapshot.estimated_cost if usage_snapshot is not None else None,
+            stop_reason=turn.stop_reason,
+            error=error,
+        )
+
+    def _complete_pending_tool_results(self, turn: QueryTurnState) -> list[ToolResultEvent]:
+        assistant_tool_ids: set[str] = set()
+        for message in turn.assistant_messages:
+            for block in message.content:
+                if isinstance(block, ToolUseBlock):
+                    assistant_tool_ids.add(block.id)
+        completed_ids: set[str] = set()
+        for message in turn.tool_result_messages:
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    completed_ids.add(block.tool_use_id)
+        events: list[ToolResultEvent] = []
+        for block in turn.tool_calls:
+            if block.id not in assistant_tool_ids or block.id in completed_ids:
+                continue
+            result_block = ToolResultBlock(
+                tool_use_id=block.id,
+                content="tool call was interrupted before it returned a result",
+                is_error=True,
+            )
+            error = AgentError(
+                session_id=turn.session_id,
+                turn_id=turn.turn_id,
+                code="turn_interrupted",
+                category="runtime",
+                message=result_block.content,
+                retryable=False,
+                tool_name=block.name,
+                tool_use_id=block.id,
+            )
+            result_message = tool_result_message(
+                tool_use_id=block.id,
+                content=result_block.content,
+                is_error=True,
+                metadata={
+                    "tool_name": block.name,
+                    "interrupted": True,
+                    "turn_id": turn.turn_id,
+                    "turn_index": turn.turn_index,
+                    "error": error.model_dump(mode="json"),
+                },
+            )
+            turn.record_generated_message(result_message)
+            event = ToolResultEvent(
+                session_id=turn.session_id,
+                turn_id=turn.turn_id,
+                block=result_block,
+                error=error,
+            )
+            self.session_store.append_event(self.session, event)
+            events.append(event)
+        return events
+
+    def _hide_interrupted_turn_from_model(self, turn: QueryTurnState) -> None:
+        patch = {
+            "is_meta": True,
+            "metadata": {
+                "hidden_from_model": True,
+                "hidden_reason": "interrupted_turn",
+                "turn_id": turn.turn_id,
+            },
+        }
+        seen: set[str] = set()
+        for message in [turn.user_message, *turn.generated_messages]:
+            if message.id in seen:
+                continue
+            seen.add(message.id)
+            self.session_store.patch_message(self.session, message.id, patch)
+
+    async def _cancel_turn_side_effects(self, turn_id: str) -> None:
+        if self.permission_manager.approval_broker is not None:
+            await self.permission_manager.approval_broker.cancel_turn(turn_id)
+        from tools.builtin import PROCESSES
+
+        await PROCESSES.stop_for_turn(turn_id)
+
+    def _append_session_updated_event(
+        self,
+        *,
+        name: str | None = None,
+        name_status: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        event = SessionUpdatedEvent(
+            session_id=self.session.session_id,
+            name=name,
+            name_status=name_status,
+            permission_mode=permission_mode,
         )
         self.session_store.append_event(self.session, event)
-        return event
-
-    def _build_fallback_final_message(self) -> Message:
-        return Message(
-            type="assistant",
-            role="assistant",
-            content=[TextBlock(text="(no final assistant message was produced)")],
-            is_meta=True,
-        )
 
     def _derive_turn_counter(self) -> int:
         return sum(
@@ -477,6 +671,14 @@ class QueryEngine:
             title = fallback_session_title(first_user_input)
         try:
             self.session_store.set_generated_name(session, title)
+            self.session_store.append_event(
+                session,
+                SessionUpdatedEvent(
+                    session_id=session.session_id,
+                    name=title,
+                    name_status="ready",
+                ),
+            )
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("query_engine.session_title_persist_failed", exc_info=exc)
 
@@ -485,13 +687,13 @@ class QueryEngine:
             await self._title_task
 
     async def interrupt_turn(self, turn_id: str) -> None:
-        del turn_id
-        raise NotImplementedError("turn interruption is not implemented yet")
-
-    async def _clear_process_sessions(self) -> None:
-        from tools.builtin import PROCESSES
-
-        await PROCESSES.stop_all()
+        turn = self.current_turn
+        if turn is None or turn.turn_id != turn_id:
+            raise ValueError(f"Turn is not active: {turn_id}")
+        if self._active_cancel_event is None:
+            raise ValueError(f"Turn cannot be interrupted yet: {turn_id}")
+        self._active_cancel_event.set()
+        await self._cancel_turn_side_effects(turn_id)
 
     def transcript_preview(self) -> str:
         return "\n".join(

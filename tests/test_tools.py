@@ -10,7 +10,7 @@ from pathlib import Path
 from app.cli import parse_args
 from app.main import build_runtime
 from config.paths import get_global_permissions_path, get_project_state_dir, get_siyi_config_path
-from engine.events import ErrorEvent, FinalAnswerEvent, ToolOutputDeltaEvent, ToolResultEvent
+from engine.events import ToolOutputDeltaEvent, ToolResultEvent, TurnCompletedEvent
 from engine.message_schema import ToolResultBlock, ToolUseBlock
 from llm.base import LLMAdapter, LLMAssistantDone, LLMTextDelta, LLMToolUse
 from runtime.usage_tracker import Usage
@@ -31,26 +31,15 @@ def test_default_registry_exposes_requested_tools(tmp_path: Path) -> None:
         for schema in runtime.tool_registry.to_model_tool_schemas()
     }
     alias_names = {
-        "read_file",
-        "edit_file",
-        "write_file",
         "web_search",
         "web_fetch",
-        "glob",
-        "grep",
         "shell",
     }
 
     expected = {
-        "Read",
-        "Edit",
-        "Write",
-        "NotebookEdit",
         "exec_command",
         "write_stdin",
         "stop_command",
-        "Glob",
-        "Grep",
         "WebSearch",
         "WebFetch",
         "ToolSearch",
@@ -86,14 +75,13 @@ def test_registry_resolves_aliases_without_exposing_them_to_model(tmp_path: Path
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
     registry = runtime.tool_registry
 
-    assert registry.get_aliases()["read_file"] == "Read"
-    assert registry.find_tool("read_file") is registry.find_tool("Read")
-    assert registry.find_tool("edit_file") is registry.find_tool("Edit")
-    assert registry.find_tool("write_file") is registry.find_tool("Write")
     assert registry.find_tool("web_search") is registry.find_tool("WebSearch")
     assert registry.find_tool("web_fetch") is registry.find_tool("WebFetch")
-    assert registry.find_tool("glob") is registry.find_tool("Glob")
-    assert registry.find_tool("grep") is registry.find_tool("Grep")
+    assert "read_file" not in registry.get_aliases()
+    assert "edit_file" not in registry.get_aliases()
+    assert "write_file" not in registry.get_aliases()
+    assert "glob" not in registry.get_aliases()
+    assert "grep" not in registry.get_aliases()
 
     shell = registry.find_tool("shell")
     if sys.platform.startswith("win"):
@@ -105,20 +93,13 @@ def test_registry_resolves_aliases_without_exposing_them_to_model(tmp_path: Path
 def test_tool_schemas_remove_count_limits_except_tool_search(tmp_path: Path) -> None:
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
 
-    read = runtime.tool_registry.find_tool("Read")
-    glob = runtime.tool_registry.find_tool("Glob")
-    grep = runtime.tool_registry.find_tool("Grep")
     web_search = runtime.tool_registry.find_tool("WebSearch")
     tool_search = runtime.tool_registry.find_tool("ToolSearch")
     agent = runtime.tool_registry.find_tool("Agent")
     task_create = runtime.tool_registry.find_tool("TaskCreate")
-    assert read is not None and glob is not None and grep is not None
     assert web_search is not None and tool_search is not None
     assert agent is not None and task_create is not None
 
-    assert "limit" not in read.input_schema["properties"]
-    assert "max_results" not in glob.input_schema["properties"]
-    assert "max_matches" not in grep.input_schema["properties"]
     assert "max_results" not in web_search.input_schema["properties"]
     assert tool_search.input_schema["properties"]["max_results"]["default"] == 50
     assert "run" not in agent.input_schema["properties"]
@@ -161,67 +142,17 @@ def test_io_tools_expose_timeout_ms_and_default_to_ten_seconds(tmp_path: Path) -
     assert not validation.ok
 
 
-def test_file_tools_are_callable(tmp_path: Path) -> None:
-    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
-    context = _context(tmp_path)
+def test_exec_command_workdir_resolves_relative_to_project_root_and_allows_absolute_paths(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    nested = project / "nested"
+    project.mkdir()
+    outside.mkdir()
+    nested.mkdir()
+    context = _context(project)
 
-    write = runtime.tool_registry.find_tool("Write")
-    read = runtime.tool_registry.find_tool("Read")
-    edit = runtime.tool_registry.find_tool("Edit")
-    assert write is not None and read is not None and edit is not None
-
-    write_result = asyncio.run(
-        write.run({"file_path": "note.txt", "content": "alpha\nbeta\n"}, context)
-    )
-    assert write_result.success
-
-    edit_result = asyncio.run(
-        edit.run(
-            {"file_path": "note.txt", "old_string": "beta", "new_string": "gamma"},
-            context,
-        )
-    )
-    assert edit_result.success
-
-    read_result = asyncio.run(read.run({"file_path": "note.txt"}, context))
-    assert read_result.success
-    assert "gamma" in read_result.content
-
-
-def test_notebook_edit_tool_is_callable(tmp_path: Path) -> None:
-    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
-    context = _context(tmp_path)
-    path = tmp_path / "demo.ipynb"
-    path.write_text(
-        json.dumps(
-            {
-                "cells": [],
-                "metadata": {},
-                "nbformat": 4,
-                "nbformat_minor": 5,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    tool = runtime.tool_registry.find_tool("NotebookEdit")
-    assert tool is not None
-    result = asyncio.run(
-        tool.run(
-            {
-                "notebook_path": "demo.ipynb",
-                "cell_index": 0,
-                "action": "insert",
-                "cell_type": "markdown",
-                "source": "# Hello\n",
-            },
-            context,
-        )
-    )
-
-    assert result.success
-    notebook = json.loads(path.read_text(encoding="utf-8"))
-    assert notebook["cells"][0]["cell_type"] == "markdown"
+    assert builtin_module._resolve_path(context, "nested") == nested.resolve()
+    assert builtin_module._resolve_path(context, str(outside)) == outside.resolve()
 
 
 def test_local_execution_tools_are_callable(tmp_path: Path) -> None:
@@ -364,6 +295,113 @@ def test_exec_command_supports_idle_stdin_poll_and_stop(tmp_path: Path) -> None:
     assert stopped["status"] in {"stopped", "timed_out", "failed", "completed"}
 
 
+def test_process_sessions_are_owned_by_session(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    shell = _available_shell(runtime)
+    if shell is None:
+        return
+    script = tmp_path / "owned_process.py"
+    script.write_text(
+        "import sys, time\n"
+        "print('ready', flush=True)\n"
+        "line = sys.stdin.readline().strip()\n"
+        "print('got:' + line, flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    exec_tool = runtime.tool_registry.find_tool("exec_command")
+    write_tool = runtime.tool_registry.find_tool("write_stdin")
+    stop_tool = runtime.tool_registry.find_tool("stop_command")
+    assert exec_tool is not None and write_tool is not None and stop_tool is not None
+    owner_context = _context(tmp_path).model_copy(update={"session_id": "sess_a", "turn_id": "turn_a"})
+    other_context = _context(tmp_path).model_copy(update={"session_id": "sess_b", "turn_id": "turn_b"})
+
+    async def run_checks() -> tuple[dict, dict, dict]:
+        started_result = await exec_tool.run(
+            {
+                "shell": shell,
+                "cmd": _script_command(script, shell),
+                "tty": True,
+                "output_idle_timeout_ms": 1000,
+                "timeout_ms": 5000,
+            },
+            owner_context,
+        )
+        started = json.loads(started_result.content)
+        write_result = await write_tool.run(
+            {"session_id": started["session_id"], "chars": "x\n"},
+            other_context,
+        )
+        wrong_stop_result = await stop_tool.run({"session_id": started["session_id"]}, other_context)
+        owner_stop_result = await stop_tool.run({"session_id": started["session_id"]}, owner_context)
+        return (
+            json.loads(write_result.content),
+            json.loads(wrong_stop_result.content),
+            json.loads(owner_stop_result.content),
+        )
+
+    wrong_write, wrong_stop, owner_stop = asyncio.run(run_checks())
+
+    assert wrong_write["error"] == "process belongs to another session"
+    assert wrong_stop["status"] == "error"
+    assert owner_stop["status"] in {"stopped", "timed_out", "failed", "completed"}
+
+
+def test_stop_for_session_only_stops_matching_processes(tmp_path: Path) -> None:
+    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    shell = _available_shell(runtime)
+    if shell is None:
+        return
+    script = tmp_path / "sleep_process.py"
+    script.write_text("import time\nprint('ready', flush=True)\ntime.sleep(30)\n", encoding="utf-8")
+    exec_tool = runtime.tool_registry.find_tool("exec_command")
+    assert exec_tool is not None
+    context_a = _context(tmp_path).model_copy(update={"session_id": "sess_a", "turn_id": "turn_a"})
+    context_b = _context(tmp_path).model_copy(update={"session_id": "sess_b", "turn_id": "turn_b"})
+
+    async def run_checks() -> tuple[str, str, bool]:
+        first = json.loads(
+            (
+                await exec_tool.run(
+                    {
+                        "shell": shell,
+                        "cmd": _script_command(script, shell),
+                        "tty": True,
+                        "output_idle_timeout_ms": 200,
+                        "timeout_ms": 5000,
+                    },
+                    context_a,
+                )
+            ).content
+        )
+        second = json.loads(
+            (
+                await exec_tool.run(
+                    {
+                        "shell": shell,
+                        "cmd": _script_command(script, shell),
+                        "tty": True,
+                        "output_idle_timeout_ms": 200,
+                        "timeout_ms": 5000,
+                    },
+                    context_b,
+                )
+            ).content
+        )
+        try:
+            await builtin_module.PROCESSES.stop_for_session("sess_a")
+            second_session = builtin_module.PROCESSES.get(second["session_id"])
+            return first["session_id"], second["session_id"], bool(second_session and second_session.is_running())
+        finally:
+            await builtin_module.PROCESSES.stop_for_session("sess_b")
+
+    first_id, second_id, second_running = asyncio.run(run_checks())
+
+    assert builtin_module.PROCESSES.get(first_id) is None
+    assert second_id
+    assert second_running is True
+
+
 def test_exec_command_non_tty_closes_stdin_and_timeout_kills(tmp_path: Path) -> None:
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
     shell = _available_shell(runtime)
@@ -459,7 +497,7 @@ def test_project_management_and_lookup_tools_are_callable(tmp_path: Path) -> Non
         return result.content
 
     async def run_smoke() -> None:
-        await call("ToolSearch", {"query": "Read"})
+        await call("ToolSearch", {"query": "Config"})
         await call("Config", {"action": "set", "key": "alpha", "value": 1})
         await call("Config", {"action": "get", "key": "alpha"})
         await call("Skill", {"action": "list"})
@@ -556,13 +594,13 @@ def test_tool_search_finds_hidden_aliases(tmp_path: Path) -> None:
     tool_search = runtime.tool_registry.find_tool("ToolSearch")
     assert tool_search is not None
 
-    result = asyncio.run(tool_search.run({"query": "read_file"}, context))
+    result = asyncio.run(tool_search.run({"query": "web_search"}, context))
 
     assert result.success
     assert result.data is not None
-    assert result.data["tools"][0]["name"] == "Read"
-    assert "read_file" in result.data["tools"][0]["aliases"]
-    assert "Read (aliases: read_file)" in result.content
+    assert result.data["tools"][0]["name"] == "WebSearch"
+    assert "web_search" in result.data["tools"][0]["aliases"]
+    assert "WebSearch (aliases: web_search)" in result.content
 
 
 def test_tool_search_does_not_find_removed_process_tools(tmp_path: Path) -> None:
@@ -596,8 +634,8 @@ class ToolCallingLLM(LLMAdapter):
             yield LLMToolUse(
                 block=ToolUseBlock(
                     id="toolu_test",
-                    name="Write",
-                    input={"file_path": "tool-loop.txt", "content": "from tool"},
+                    name="ProgressTool",
+                    input={},
                 )
             )
             yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
@@ -613,36 +651,6 @@ class ToolCallingLLM(LLMAdapter):
             for message in messages
         )
         yield LLMTextDelta(delta="tool loop complete")
-        yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
-
-
-class MultiReadAliasLLM(LLMAdapter):
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def stream_chat(
-        self,
-        messages,
-        system_prompt: str,
-        tools,
-        temperature: float,
-    ) -> AsyncIterator[LLMTextDelta | LLMToolUse | LLMAssistantDone]:
-        del system_prompt, tools, temperature
-        self.calls += 1
-        if self.calls == 1:
-            for index in range(4):
-                yield LLMToolUse(
-                    block=ToolUseBlock(
-                        id=f"toolu_read_{index}",
-                        name="read_file",
-                        input={"file_path": f"file-{index}.txt"},
-                    )
-                )
-            yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
-            return
-
-        assert sum(1 for message in messages if message.has_tool_result()) >= 4
-        yield LLMTextDelta(delta="read aliases complete")
         yield LLMAssistantDone(usage=Usage(input_tokens=1, output_tokens=1))
 
 
@@ -685,10 +693,11 @@ def test_query_engine_executes_tool_use_and_continues(tmp_path: Path) -> None:
     config_path.write_text(json.dumps({"permission_mode": "custom"}), encoding="utf-8")
     permissions_path = get_global_permissions_path()
     permissions_path.write_text(
-        json.dumps({"custom_permissions": {"allow": ["Write(*)"]}}),
+        json.dumps({"custom_permissions": {"allow": ["ProgressTool(*)"]}}),
         encoding="utf-8",
     )
     runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
+    runtime.tool_registry.register(ProgressTool())
     runtime.query_engine.llm = ToolCallingLLM()
 
     async def collect():
@@ -697,25 +706,8 @@ def test_query_engine_executes_tool_use_and_continues(tmp_path: Path) -> None:
     events = asyncio.run(collect())
 
     assert any(isinstance(event, ToolResultEvent) for event in events)
-    assert isinstance(events[-1], FinalAnswerEvent)
-    assert (tmp_path / "tool-loop.txt").read_text(encoding="utf-8") == "from tool"
-    assert runtime.query_engine.llm.calls == 2
-
-
-def test_concurrent_read_file_alias_calls_do_not_trigger_permission_prompt_crash(tmp_path: Path) -> None:
-    for index in range(4):
-        (tmp_path / f"file-{index}.txt").write_text(f"content {index}", encoding="utf-8")
-    runtime = build_runtime(parse_args(["--cwd", str(tmp_path)]))
-    runtime.query_engine.llm = MultiReadAliasLLM()
-
-    async def collect():
-        return [event async for event in runtime.query_engine.submit_user_input("read files")]
-
-    events = asyncio.run(collect())
-
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert sum(1 for event in events if isinstance(event, ToolResultEvent)) == 4
-    assert isinstance(events[-1], FinalAnswerEvent)
+    assert isinstance(events[-1], TurnCompletedEvent)
+    assert events[-1].status == "completed"
     assert runtime.query_engine.llm.calls == 2
 
 
@@ -738,7 +730,8 @@ def test_tool_output_delta_events_are_emitted_but_not_persisted(tmp_path: Path) 
     events = asyncio.run(collect())
 
     assert any(isinstance(event, ToolOutputDeltaEvent) for event in events)
-    assert isinstance(events[-1], FinalAnswerEvent)
+    assert isinstance(events[-1], TurnCompletedEvent)
+    assert events[-1].status == "completed"
     entries = [
         json.loads(line)
         for line in runtime.query_engine.session.path.read_text(encoding="utf-8").splitlines()

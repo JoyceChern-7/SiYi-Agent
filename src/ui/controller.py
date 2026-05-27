@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from pydantic import SecretStr
-
 from config.paths import get_global_skills_dir, get_skill_paths_path, get_user_settings_path
 from config.user_settings import (
     DEFAULT_MODEL_TIERS,
@@ -18,10 +16,11 @@ from config.user_settings import (
     UserSettings,
     default_user_settings,
     load_user_settings,
-    save_user_settings,
 )
 from engine.query_engine import QueryEngine
 from runtime.permissions import PermissionRequest
+from runtime.services import AgentServices
+from runtime.session_runtime import SessionRuntime
 from ui.input_parser import ParsedInput
 from ui.prompt_io import PromptIO
 from ui.renderer import ConsoleRenderer
@@ -40,8 +39,11 @@ class REPLController:
         engine: QueryEngine,
         renderer: ConsoleRenderer,
         prompt_io: PromptIO | None = None,
+        session_runtime: SessionRuntime | None = None,
     ) -> None:
         self.engine = engine
+        self.session_runtime = session_runtime
+        self.services = AgentServices.from_engine(engine)
         self.renderer = renderer
         self.prompt_io = prompt_io
         self._permission_prompt_lock = asyncio.Lock()
@@ -102,12 +104,12 @@ class REPLController:
             await self._handle_compact(parsed.args)
             return True
         if command == "session":
-            self.renderer.render_session(self.engine.get_session_snapshot())
+            self.renderer.render_session(self.services.session.current())
             return True
         if command == "sessions":
             self.renderer.render_sessions(
-                self.engine.list_sessions(),
-                current_session_id=self.engine.get_session_snapshot().session_id,
+                self.services.session.list(),
+                current_session_id=self.services.session.current().session_id,
             )
             return True
         if command == "session_new":
@@ -115,7 +117,7 @@ class REPLController:
                 self.renderer.render_error("usage: /session_new")
                 return True
             try:
-                snapshot = await self.engine.new_session()
+                snapshot = await self.services.session.create()
             except Exception as exc:  # noqa: BLE001 - keep REPL alive
                 self.renderer.render_error(f"failed to create session: {exc}")
                 return True
@@ -126,7 +128,7 @@ class REPLController:
                 self.renderer.render_error("usage: /session_switch <session_id>")
                 return True
             try:
-                snapshot = await self.engine.switch_session(parsed.args[0])
+                snapshot = await self.services.session.switch(parsed.args[0])
             except Exception as exc:  # noqa: BLE001 - keep REPL alive
                 self.renderer.render_error(f"failed to switch session: {exc}")
                 return True
@@ -163,7 +165,7 @@ class REPLController:
     def _handle_permission(self, args: list[str]) -> None:
         valid_modes = {"default", "full", "custom"}
         if not args:
-            snapshot = self.engine.get_permission_snapshot()
+            snapshot = self.services.permission.snapshot()
             self.renderer.render_note(
                 "permission mode: "
                 f"session={snapshot.session_mode} global={snapshot.global_mode}\n"
@@ -176,7 +178,7 @@ class REPLController:
             if len(args) != 2 or args[1] not in valid_modes:
                 self.renderer.render_error("usage: /permission --global <default|full|custom>")
                 return
-            snapshot = self.engine.set_global_permission_mode(args[1])
+            snapshot = self.services.permission.set_global_mode(args[1])
             self.renderer.render_note(
                 f"global permission mode set to {snapshot.global_mode}; "
                 f"current session remains {snapshot.session_mode}"
@@ -187,7 +189,7 @@ class REPLController:
             self.renderer.render_error("usage: /permission [--global] <default|full|custom>")
             return
 
-        snapshot = self.engine.set_permission_mode(args[0])
+        snapshot = self.services.permission.set_session_mode(args[0])
         self.renderer.render_note(f"session permission mode set to {snapshot.session_mode}")
 
     def _handle_history(self, args: list[str]) -> bool:
@@ -277,13 +279,14 @@ class REPLController:
         self.renderer.render_note(f"installed skills repository: {target}")
 
     async def _submit_prompt(self, prompt: str) -> None:
-        async for event in self.engine.submit_user_input(prompt):
+        runner = self.session_runtime or self.engine
+        async for event in runner.submit_user_input(prompt):
             self.renderer.render_event(event)
 
     async def _handle_compact(self, args: list[str]) -> None:
         instructions = " ".join(args).strip() or None
         try:
-            result = await self.engine.compact(instructions)
+            result = await self.services.compact.compact(instructions)
         except Exception as exc:  # noqa: BLE001 - surface compact failures in the REPL
             self.renderer.render_error(f"compact failed: {exc}")
             return
@@ -352,27 +355,8 @@ class REPLController:
             default_tier=default_tier,
             models=configured_models,
         )
-        path = save_user_settings(settings, get_user_settings_path())
-        self._apply_login_settings(settings)
+        path = self.services.account.save_and_apply(settings, get_user_settings_path())
         self.renderer.render_note(f"saved API settings to {path}")
-
-    def _apply_login_settings(self, settings: UserSettings) -> None:
-        selected_model = settings.models[settings.default_tier].model
-        api_key = SecretStr(settings.api_key) if settings.api_key else None
-        self.engine.settings.model = self.engine.settings.model.model_copy(
-            update={
-                "provider": settings.provider,
-                "api_key": api_key,
-                "base_url": settings.base_url,
-                "model": selected_model,
-            }
-        )
-        if hasattr(self.engine.llm, "api_key"):
-            self.engine.llm.api_key = api_key
-        if hasattr(self.engine.llm, "base_url"):
-            self.engine.llm.base_url = settings.base_url
-        if hasattr(self.engine.llm, "model"):
-            self.engine.llm.model = selected_model
 
 
 def _load_configured_skill_paths(path: Path) -> list[str]:

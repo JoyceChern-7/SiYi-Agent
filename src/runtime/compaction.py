@@ -15,7 +15,6 @@ from engine.message_schema import (
     compact_boundary_message,
     compact_summary_message,
     get_messages_after_compact_boundary,
-    make_message,
     user_message,
 )
 from llm.base import LLMAdapter, LLMAssistantDone, LLMTextDelta, LLMThinkingDelta, LLMToolUse
@@ -24,22 +23,14 @@ from runtime.token_budget import TokenBudget
 
 TIME_BASED_MC_CLEARED_MESSAGE = "[Old tool result content cleared]"
 COMPACTABLE_TOOLS = {
-    "Read",
     "PowerShell",
     "Bash",
-    "Grep",
-    "Glob",
     "WebSearch",
     "WebFetch",
-    "Edit",
-    "Write",
 }
 
 DEFAULT_MICROCOMPACT_GAP_MINUTES = 60
 DEFAULT_MICROCOMPACT_KEEP_RECENT = 5
-POST_COMPACT_MAX_FILES_TO_RESTORE = 5
-POST_COMPACT_TOKEN_BUDGET = 50_000
-POST_COMPACT_MAX_TOKENS_PER_FILE = 5_000
 COMPACT_MAX_PTL_RETRIES = 3
 
 SESSION_MEMORY_MIN_TOKENS = 10_000
@@ -242,15 +233,9 @@ class CompactionManager:
         preserved_messages = [
             _copy_message_for_compact_segment(message) for message in messages_to_keep
         ]
-        restore_messages = self._build_read_restore_messages(
-            source_messages,
-            messages_to_keep,
-            project_root=project_root,
-        )
         messages_after_boundary = [
             summary_message,
             *preserved_messages,
-            *restore_messages,
         ]
         post_tokens = token_budget.estimate_request_tokens(
             messages_after_boundary,
@@ -335,60 +320,6 @@ class CompactionManager:
                 break
             current = truncated
         raise RuntimeError("prompt too long while compacting conversation")
-
-    def _build_read_restore_messages(
-        self,
-        messages: list[Message],
-        preserved_messages: list[Message],
-        *,
-        project_root: Path | None,
-    ) -> list[Message]:
-        preserved_paths = _collect_read_paths(preserved_messages, project_root=project_root)
-        candidates = [
-            path
-            for path in _collect_recent_read_paths(messages, project_root=project_root)
-            if path not in preserved_paths
-        ]
-        restored: list[Message] = []
-        used_tokens = 0
-        for path in candidates[:POST_COMPACT_MAX_FILES_TO_RESTORE]:
-            try:
-                if not path.exists() or not path.is_file():
-                    continue
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-
-            content = _truncate_to_tokens(
-                content,
-                POST_COMPACT_MAX_TOKENS_PER_FILE,
-                marker="\n\n[... file content truncated for post-compact restore]",
-            )
-            text = (
-                "[post-compact restored Read file]\n"
-                f"Path: {path}\n"
-                "Content:\n"
-                f"{content}"
-            )
-            message_tokens = _estimate_text_tokens(text)
-            if used_tokens + message_tokens > POST_COMPACT_TOKEN_BUDGET:
-                break
-            used_tokens += message_tokens
-            restored.append(
-                make_message(
-                    role="user",
-                    message_type="user",
-                    blocks=[TextBlock(text=text)],
-                    is_meta=True,
-                    metadata={
-                        "subtype": "post_compact_read_restore",
-                        "send_to_provider": True,
-                        "path": str(path),
-                    },
-                )
-            )
-        return restored
-
 
 async def _stream_compact_summary(
     llm: LLMAdapter,
@@ -570,50 +501,6 @@ def _collect_compactable_tool_ids(messages: list[Message]) -> list[str]:
             if isinstance(block, ToolUseBlock) and block.name in COMPACTABLE_TOOLS:
                 ids.append(block.id)
     return ids
-
-
-def _collect_recent_read_paths(messages: list[Message], *, project_root: Path | None) -> list[Path]:
-    paths: list[Path] = []
-    seen: set[Path] = set()
-    for message in reversed(messages):
-        if message.role != "assistant":
-            continue
-        for block in reversed(message.content):
-            if not isinstance(block, ToolUseBlock) or block.name != "Read":
-                continue
-            path = _resolve_read_path(block, project_root=project_root)
-            if path is None or path in seen:
-                continue
-            seen.add(path)
-            paths.append(path)
-    return paths
-
-
-def _collect_read_paths(messages: list[Message], *, project_root: Path | None) -> list[Path]:
-    paths: list[Path] = []
-    seen: set[Path] = set()
-    for message in messages:
-        if message.role != "assistant":
-            continue
-        for block in message.content:
-            if not isinstance(block, ToolUseBlock) or block.name != "Read":
-                continue
-            path = _resolve_read_path(block, project_root=project_root)
-            if path is None or path in seen:
-                continue
-            seen.add(path)
-            paths.append(path)
-    return paths
-
-
-def _resolve_read_path(block: ToolUseBlock, *, project_root: Path | None) -> Path | None:
-    raw_path = block.input.get("file_path") or block.input.get("path")
-    if not raw_path:
-        return None
-    path = Path(str(raw_path)).expanduser()
-    if not path.is_absolute() and project_root is not None:
-        path = project_root / path
-    return path.resolve()
 
 
 def _format_compact_summary(summary: str) -> str:

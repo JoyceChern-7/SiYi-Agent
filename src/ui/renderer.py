@@ -5,18 +5,19 @@ from rich.table import Table
 from rich.text import Text
 
 from engine.query_engine import SessionSnapshot
-from runtime.session_store import SessionMetadata
+from runtime.read_model import SessionSummary
 from engine.events import (
+    AgentError,
     AssistantDeltaEvent,
-    AssistantDoneEvent,
-    ErrorEvent,
-    FinalAnswerEvent,
+    AssistantMessageEvent,
+    ApprovalResolvedEvent,
     QueryEvent,
     PermissionRequestEvent,
-    StatusEvent,
     ToolOutputDeltaEvent,
     ToolResultEvent,
-    ToolUseEvent,
+    ToolCallEvent,
+    TurnCompletedEvent,
+    TurnStartedEvent,
 )
 from engine.message_schema import Message
 
@@ -30,23 +31,25 @@ class ConsoleRenderer:
         self._tool_output_open = False
 
     def render_event(self, event: QueryEvent) -> None:
-        if isinstance(event, StatusEvent):
-            self.render_status_event(event)
+        if isinstance(event, TurnStartedEvent):
+            self.render_turn_started(event)
         elif isinstance(event, AssistantDeltaEvent):
             self.render_assistant_delta(event.delta)
-        elif isinstance(event, AssistantDoneEvent):
+        elif isinstance(event, AssistantMessageEvent):
             self.render_assistant_done()
-        elif isinstance(event, ToolUseEvent):
-            self.render_tool_use(event)
+        elif isinstance(event, ToolCallEvent):
+            self.render_tool_call(event)
         elif isinstance(event, ToolOutputDeltaEvent):
             self.render_tool_output_delta(event)
         elif isinstance(event, PermissionRequestEvent):
             self.render_permission_request(event)
+        elif isinstance(event, ApprovalResolvedEvent):
+            self.render_approval_resolved(event)
         elif isinstance(event, ToolResultEvent):
             self.render_tool_result(event)
-        elif isinstance(event, FinalAnswerEvent):
-            self.render_final(event)
-        elif isinstance(event, ErrorEvent):
+        elif isinstance(event, TurnCompletedEvent):
+            self.render_turn_completed(event)
+        elif isinstance(event, AgentError):
             self.render_error(event.message)
 
     def render_welcome(self, *, session_id: str, project_root: str, model: str) -> None:
@@ -70,7 +73,7 @@ class ConsoleRenderer:
             self.console.print()
             self._assistant_open = False
 
-    def render_tool_use(self, event: ToolUseEvent) -> None:
+    def render_tool_call(self, event: ToolCallEvent) -> None:
         self.render_assistant_done()
         self.console.print(f"[dim yellow]tool call:[/dim yellow] {event.block.name} {event.block.input}")
 
@@ -92,12 +95,8 @@ class ConsoleRenderer:
         if self.debug:
             self.console.print(f"[dim]{message}[/dim]")
 
-    def render_status_event(self, event: StatusEvent) -> None:
-        highlighted_codes = {"budget_warning", "autocompact_recommended"}
-        if event.code in highlighted_codes:
-            self.console.print(f"[yellow]{event.message}[/yellow]")
-            return
-        self.render_status(event.message)
+    def render_turn_started(self, event: TurnStartedEvent) -> None:
+        self.render_status(f"turn={event.turn_index}")
 
     def render_permission_request(self, event: PermissionRequestEvent) -> None:
         self.render_assistant_done()
@@ -105,7 +104,18 @@ class ConsoleRenderer:
             f"[yellow]permission requested:[/yellow] {event.tool_name} {event.tool_input}"
         )
 
-    def render_final(self, event: FinalAnswerEvent) -> None:
+    def render_approval_resolved(self, event: ApprovalResolvedEvent) -> None:
+        self.render_status(
+            f"approval {event.approval_id}: {'approved' if event.approved else 'denied'}"
+        )
+
+    def render_turn_completed(self, event: TurnCompletedEvent) -> None:
+        if event.status == "failed" and event.error is not None:
+            self.render_error(event.error.message)
+            return
+        if event.status == "interrupted":
+            self.render_note("turn interrupted")
+            return
         if self.debug and event.usage:
             self.console.print(f"[dim]usage={event.usage.model_dump()}[/dim]")
 
@@ -140,14 +150,14 @@ class ConsoleRenderer:
         table.add_row("turns", str(snapshot.turn_count))
         table.add_row("completed_turns", str(snapshot.completed_turns))
         table.add_row("messages", str(snapshot.message_count))
-        table.add_row("last_error", snapshot.last_error or "-")
+        table.add_row("last_error", snapshot.last_error.message if snapshot.last_error else "-")
         table.add_row("usage", str(snapshot.total_usage))
         table.add_row("estimated_cost", f"{snapshot.estimated_total_cost:.6f}")
         self.console.print(table)
 
     def render_sessions(
         self,
-        sessions: list[SessionMetadata],
+        sessions: list[SessionSummary],
         *,
         current_session_id: str,
     ) -> None:

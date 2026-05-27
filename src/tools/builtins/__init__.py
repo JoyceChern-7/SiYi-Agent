@@ -7,7 +7,6 @@ from tools.base import BaseTool
 
 from .common import *  # noqa: F403
 from .config_tools import ConfigTool
-from .file_tools import EditTool, GlobTool, GrepTool, NotebookEditTool, ReadTool, WriteTool
 from .interaction_tools import (
     AskUserQuestionTool,
     EnterPlanModeTool,
@@ -54,15 +53,9 @@ from .workflow_tools import WorkflowTool, _discover_workflows, _load_workflow_de
 
 def register_builtin_tools(registry: Any) -> None:
     tools: list[BaseTool] = [
-        ReadTool(),
-        EditTool(),
-        WriteTool(),
-        NotebookEditTool(),
         ExecCommandTool(),
         WriteStdinTool(),
         StopCommandTool(),
-        GlobTool(),
-        GrepTool(),
         WebSearchTool(),
         WebFetchTool(),
         AskUserQuestionTool(),
@@ -83,9 +76,9 @@ def register_builtin_tools(registry: Any) -> None:
         ConfigTool(),
     ]
     if _bash_exe() is not None:
-        tools.insert(4, BashTool())
+        tools.insert(3, BashTool())
     if sys.platform.startswith("win"):
-        tools.insert(5 if _bash_exe() is not None else 4, PowerShellTool())
+        tools.insert(4 if _bash_exe() is not None else 3, PowerShellTool())
     for tool in tools:
         registry.register(tool)
 
@@ -93,13 +86,8 @@ def register_builtin_tools(registry: Any) -> None:
     registry.register(WorkflowTool(lambda: registry))
 
     aliases = {
-        "read_file": "Read",
-        "edit_file": "Edit",
-        "write_file": "Write",
         "web_search": "WebSearch",
         "web_fetch": "WebFetch",
-        "glob": "Glob",
-        "grep": "Grep",
     }
     if registry.find_tool("PowerShell") is not None:
         aliases["shell"] = "PowerShell"
@@ -122,17 +110,12 @@ __all__ = [
     "AskUserQuestionTool",
     "BashTool",
     "ConfigTool",
-    "EditTool",
     "EnterPlanModeTool",
     "ExecCommandTool",
     "ExitPlanModeTool",
-    "GlobTool",
-    "GrepTool",
     "ListMcpResourcesTool",
-    "NotebookEditTool",
     "PowerShellTool",
     "ReadMcpResourceTool",
-    "ReadTool",
     "SendMessageTool",
     "SendUserMessageTool",
     "SkillTool",
@@ -148,7 +131,6 @@ __all__ = [
     "WebSearchTool",
     "WorkflowTool",
     "WriteStdinTool",
-    "WriteTool",
     "ProcessSession",
     "ProcessSessionManager",
     "_StreamBuffer",

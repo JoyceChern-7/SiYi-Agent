@@ -300,14 +300,14 @@ class _TrackingPromptIO:
 
 
 def test_controller_login_saves_and_applies_user_settings(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("SIYI_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr("config.paths.Path.home", lambda: tmp_path)
     engine = _FakeEngine()
     renderer = _FakeRenderer()
     controller = REPLController(engine, renderer, prompt_io=_FakePromptIO())
 
     asyncio.run(controller.handle(parse_input("/login")))
 
-    saved_payload = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+    saved_payload = json.loads((tmp_path / ".siyi" / "settings.json").read_text(encoding="utf-8"))
     assert saved_payload["provider"] == "openai-compatible"
     assert "system_prompt" not in saved_payload
     assert "model" not in saved_payload

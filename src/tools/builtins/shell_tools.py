@@ -196,12 +196,13 @@ class WriteStdinTool(BaseTool):
         return not raw_input.get("chars") and not bool(raw_input.get("close_stdin"))
 
     def check_permissions(self, raw_input: JsonObject, context: ToolContext) -> PermissionResult:
-        del context
         if not raw_input.get("chars") and not bool(raw_input.get("close_stdin")):
             return PermissionResult.allow(reason="polling process output", source="tool")
         session = PROCESSES.get(str(raw_input.get("session_id") or ""))
         if session is None:
             return PermissionResult.deny(reason="process session not found", source="tool")
+        if session.session_id is not None and session.session_id != context.session_id:
+            return PermissionResult.deny(reason="process belongs to another session", source="tool")
         if not session.tty or not session.stdin_authorized:
             return PermissionResult.deny(reason="stdin is not enabled for this session", source="tool")
         return PermissionResult.allow(reason="stdin authorized by exec_command session", source="tool")
@@ -233,6 +234,14 @@ class StopCommandTool(BaseTool):
     name = "stop_command"
     description = "Stops a running exec_command session."
     input_schema = _schema({"session_id": {"type": "string"}}, required=["session_id"])
+
+    def check_permissions(self, raw_input: JsonObject, context: ToolContext) -> PermissionResult:
+        session = PROCESSES.get(str(raw_input.get("session_id") or ""))
+        if session is None:
+            return PermissionResult.deny(reason="process session not found", source="tool")
+        if session.session_id is not None and session.session_id != context.session_id:
+            return PermissionResult.deny(reason="process belongs to another session", source="tool")
+        return PermissionResult.allow(reason="process belongs to this session", source="tool")
 
     async def run(self, raw_input: JsonObject, context: ToolContext) -> ToolResult:
         started_at = time.perf_counter()

@@ -19,6 +19,7 @@ from runtime.permissions import (
     load_global_permission_mode,
 )
 from runtime.project_store import ProjectStore
+from runtime.session_runtime import SessionRuntime
 from runtime.session_store import JsonlSessionStore
 from runtime.token_budget import TokenBudget
 from runtime.usage_tracker import UsageTracker
@@ -41,6 +42,7 @@ class AppRuntime:
     token_budget: TokenBudget
     usage_tracker: UsageTracker
     query_engine: QueryEngine
+    session_runtime: SessionRuntime
     renderer: ConsoleRenderer
 
 
@@ -112,6 +114,7 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
         token_budget=token_budget,
         usage_tracker=usage_tracker,
     )
+    session_runtime = SessionRuntime(query_engine)
 
     runtime = AppRuntime(
         settings=settings,
@@ -124,6 +127,7 @@ def build_runtime(options: CLIOptions) -> AppRuntime:
         token_budget=token_budget,
         usage_tracker=usage_tracker,
         query_engine=query_engine,
+        session_runtime=session_runtime,
         renderer=renderer,
     )
     LOGGER.debug(
@@ -140,7 +144,7 @@ async def _run_internal_worker(runtime: AppRuntime, prompt: str | None) -> int:
         )
         return 2
 
-    async for event in runtime.query_engine.submit_user_input(prompt):
+    async for event in runtime.session_runtime.submit_user_input(prompt):
         runtime.renderer.render_event(event)
     return 0 if not runtime.query_engine.last_error else 1
 
@@ -160,5 +164,5 @@ async def run(options: CLIOptions) -> int:
     if runtime.settings.runtime.non_interactive:
         return await _run_internal_worker(runtime, runtime.settings.runtime.initial_prompt)
 
-    await run_repl(runtime.query_engine, runtime.renderer)
+    await run_repl(runtime.query_engine, runtime.renderer, session_runtime=runtime.session_runtime)
     return 0

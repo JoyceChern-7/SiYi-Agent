@@ -109,9 +109,9 @@ def test_alias_tools_inherit_target_permissions(tmp_path: Path, monkeypatch: pyt
         result = await manager.authorize(tool, payload, context)
         return result.decision
 
-    assert asyncio.run(authorize_alias("read_file", {"file_path": "README.md"})) == "allow"
-    assert asyncio.run(authorize_alias("glob", {"pattern": "*.py"})) == "allow"
-    assert asyncio.run(authorize_alias("grep", {"pattern": "x"})) == "allow"
+    assert registry.find_tool("read_file") is None
+    assert registry.find_tool("glob") is None
+    assert registry.find_tool("grep") is None
     assert asyncio.run(authorize_alias("web_search", {"query": "docs"})) == "allow"
     assert requester_calls == 0
 
@@ -255,7 +255,12 @@ def test_permission_approval_broker_resolves_pending_request(tmp_path: Path) -> 
         assert event.tool_name == "Write"
         assert event.tool_input == {"file_path": "a.txt"}
         assert await broker.resolve(pending[0].approval_id, True)
-        return await task
+        result = await task
+        resolved_event = await progress_queue.get()
+        assert resolved_event.type == "approval_resolved"
+        assert resolved_event.approval_id == pending[0].approval_id
+        assert resolved_event.approved is True
+        return result
 
     result = asyncio.run(run())
 
@@ -275,6 +280,39 @@ def test_permission_approval_broker_denies_pending_request(tmp_path: Path) -> No
         pending = await broker.pending()
         assert await broker.resolve(pending[0].approval_id, False)
         return await task
+
+    result = asyncio.run(run())
+
+    assert result.decision == "deny"
+
+
+def test_permission_approval_broker_cancel_turn_denies_pending_request(tmp_path: Path) -> None:
+    manager = PermissionManager.from_settings(ToolSettings(), project_root=tmp_path)
+    broker = PermissionApprovalBroker()
+    manager.set_approval_broker(broker)
+    tool = _DummyWriteTool()
+    progress_queue: asyncio.Queue = asyncio.Queue()
+    context = _context(tmp_path).model_copy(
+        update={
+            "session_id": "sess_test",
+            "turn_id": "turn_cancel",
+            "progress_queue": progress_queue,
+        }
+    )
+
+    async def run() -> PermissionResult:
+        task = asyncio.create_task(manager.authorize(tool, {"file_path": "a.txt"}, context))
+        while not await broker.pending():
+            await asyncio.sleep(0)
+        await broker.cancel_turn("turn_cancel")
+        result = await task
+        assert await broker.pending() == []
+        request_event = await progress_queue.get()
+        resolved_event = await progress_queue.get()
+        assert request_event.type == "permission_request"
+        assert resolved_event.type == "approval_resolved"
+        assert resolved_event.approved is False
+        return result
 
     result = asyncio.run(run())
 
@@ -317,10 +355,10 @@ def test_tool_batches_group_consecutive_concurrency_safe_tools(tmp_path: Path) -
 
     batches = _tool_batches(
         [
-            ToolUseBlock(name="Read", input={"file_path": "a.txt"}),
-            ToolUseBlock(name="Glob", input={"pattern": "*.txt"}),
-            ToolUseBlock(name="Write", input={"file_path": "a.txt", "content": "x"}),
-            ToolUseBlock(name="Grep", input={"pattern": "x"}),
+            ToolUseBlock(name="WebSearch", input={"query": "docs"}),
+            ToolUseBlock(name="WebFetch", input={"url": "https://example.com"}),
+            ToolUseBlock(name="Config", input={"action": "set", "key": "x", "value": 1}),
+            ToolUseBlock(name="ToolSearch", input={"query": "tools"}),
         ],
         registry,
         context,

@@ -31,6 +31,16 @@ def _normalize_session_name(name: str) -> str:
     return " ".join(name.strip().split())
 
 
+def _apply_message_patch(message: Message, patch: dict[str, Any]) -> None:
+    if "is_meta" in patch:
+        message.is_meta = bool(patch["is_meta"])
+    if "is_virtual" in patch:
+        message.is_virtual = bool(patch["is_virtual"])
+    metadata = patch.get("metadata")
+    if isinstance(metadata, dict):
+        message.metadata.update(metadata)
+
+
 @dataclass(slots=True)
 class SessionMetadata:
     session_id: str
@@ -89,7 +99,7 @@ class SessionMetadata:
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "session_id": self.session_id,
             "path": str(self.path),
             "project_id": self.project_id,
@@ -101,6 +111,7 @@ class SessionMetadata:
             "message_count": self.message_count,
             "legacy": self.legacy,
         }
+        return payload
 
 
 @dataclass(slots=True)
@@ -139,7 +150,10 @@ class JsonlSessionStore:
                 self._ensure_project_for_metadata(metadata)
                 return self._open_metadata(metadata)
 
-        return self.create_session(project=project, permission_mode=permission_mode)
+        return self.create_session(
+            project=project,
+            permission_mode=permission_mode,
+        )
 
     def create_session(
         self,
@@ -216,6 +230,28 @@ class JsonlSessionStore:
         )
         self._touch_metadata(session.metadata)
 
+    def patch_message(
+        self,
+        session: SessionHandle,
+        message_id: str,
+        patch: dict[str, Any],
+    ) -> None:
+        for message in session.messages:
+            if message.id == message_id:
+                _apply_message_patch(message, patch)
+                break
+        self._append_entry(
+            session.path,
+            {
+                "kind": "message_patch",
+                "session_id": session.session_id,
+                "timestamp": _now(),
+                "message_id": message_id,
+                "patch": patch,
+            },
+        )
+        self._touch_metadata(session.metadata)
+
     def update_metadata(self, session: SessionHandle) -> None:
         session.metadata.updated_at = _now()
         self._append_entry(
@@ -254,13 +290,21 @@ class JsonlSessionStore:
             return []
 
         messages: list[Message] = []
+        by_id: dict[str, Message] = {}
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue
                 entry = json.loads(line)
                 if entry.get("kind") == "message":
-                    messages.append(Message.model_validate(entry["message"]))
+                    message = Message.model_validate(entry["message"])
+                    messages.append(message)
+                    by_id[message.id] = message
+                elif entry.get("kind") == "message_patch":
+                    message = by_id.get(str(entry.get("message_id") or ""))
+                    patch = entry.get("patch")
+                    if message is not None and isinstance(patch, dict):
+                        _apply_message_patch(message, patch)
         return messages
 
     def list_sessions(self) -> list[SessionMetadata]:

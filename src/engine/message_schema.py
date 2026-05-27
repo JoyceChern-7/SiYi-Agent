@@ -56,10 +56,7 @@ class Message(BaseModel):
     is_virtual: bool = False
     # 和 is_meta 不同, is_virtual 
     # 是指这个消息在任何场景下都不应该被视为真实的用户或助手消息.
-    # 为什么将 is_meta 和 is_virtual 分开? 
-    # 因为有些消息虽然不应该被发送给 provider, 但在 app 内部的某些逻辑中仍然需要被视为真实的消息. 
-    # 例如, tool_result_message 生成的消息虽然不应该被发送给 provider, 但它确实代表了一个工具调用的结果, 在 app 内部的权限管理或上下文构建等逻辑中应该被视为一个真实的消息.
-
+ 
     tool_use_result: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     # metadata 是一个开放的字段, 可以用来存储任意与消息相关的结构化信息. 
@@ -254,10 +251,11 @@ def normalize_messages_for_api(messages: list[Message]) -> list[Message]:
             continue
 
         send_to_provider = bool(message.metadata.get("send_to_provider"))
+        if message.is_meta and not send_to_provider:
+            continue
 
         if (
             message.role == "user"
-            and (not message.is_meta or send_to_provider)
             and _is_plain_text_message(message)
         ):
             pending_user_text.append(message.to_plain_text())
@@ -277,7 +275,7 @@ def normalize_messages_for_api(messages: list[Message]) -> list[Message]:
                 normalized.append(message)
                 continue
 
-        if message.role == "system" and (not message.is_meta or send_to_provider):
+        if message.role == "system":
             normalized.append(message)
 
     flush_pending_user()
